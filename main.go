@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -19,16 +20,16 @@ func min(a, b int) int {
 }
 
 // handleConnection performs initial checks on the client's data,
-// blocks potential exploit requests, and then forwards data
-// bidirectionally between the client and backend server.
-func handleConnection(client net.Conn, remoteAddr, remotePort string) {
+// logs connection info, and then forwards data between the client
+// and backend server.
+func handleConnection(client net.Conn, targetIP, targetPort string) {
 	startTime := time.Now()
 	clientIP := strings.Split(client.RemoteAddr().String(), ":")[0]
 	log.Printf("Accepted connection from %s", clientIP)
 	defer client.Close()
 
 	// Connect to backend server.
-	backend, err := net.Dial("tcp", net.JoinHostPort(remoteAddr, remotePort))
+	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf("Error connecting to backend for %s: %v", clientIP, err)
 		return
@@ -46,14 +47,14 @@ func handleConnection(client net.Conn, remoteAddr, remotePort string) {
 	// Remove the deadline.
 	client.SetReadDeadline(time.Time{})
 
-	// Check for common exploit strings.
+	// Check for common exploit strings and block if found.
 	initialData := string(initialBuf[:n])
 	if strings.Contains(initialData, "players.json") || strings.Contains(initialData, "info.json") {
 		log.Printf("Blocked exploit request from %s", clientIP)
 		return
 	}
 
-	// Log the initial packet (first 64 bytes, if available).
+	// Log the first 64 bytes of the initial data.
 	log.Printf("Initial packet from %s: %q", clientIP, initialData[:min(n, 64)])
 
 	// Forward the initial data to the backend.
@@ -63,50 +64,51 @@ func handleConnection(client net.Conn, remoteAddr, remotePort string) {
 		return
 	}
 
-	// Start bidirectional copying.
+	// Start bidirectional copy.
 	done := make(chan struct{}, 2)
 	go func() {
-		// Copy from client to backend.
 		io.Copy(backend, client)
 		done <- struct{}{}
 	}()
 	go func() {
-		// Copy from backend to client.
 		io.Copy(client, backend)
 		done <- struct{}{}
 	}()
 
-	// Wait for one of the copy operations to finish.
+	// Wait until one side closes.
 	<-done
 	log.Printf("Connection from %s closed after %v", clientIP, time.Since(startTime))
 }
 
 func main() {
-	if len(os.Args) != 4 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <listen_port> <remote_address> <remote_port>\n", os.Args[0])
+	// Define flags.
+	targetIP := flag.String("targetIP", "", "Backend server IP address")
+	targetPort := flag.String("targetPort", "", "Backend server port")
+	listenPort := flag.String("listenPort", "", "Port on which the proxy listens")
+	flag.Parse()
+
+	// Ensure required flags are provided.
+	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
+		fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port>\n", os.Args[0])
 		os.Exit(1)
 	}
 
-	listenPort := os.Args[1]
-	remoteAddr := os.Args[2]
-	remotePort := os.Args[3]
-
-	// Start TCP listener on the specified port.
-	listener, err := net.Listen("tcp", ":"+listenPort)
+	// Start the TCP listener.
+	listener, err := net.Listen("tcp", ":"+*listenPort)
 	if err != nil {
-		log.Fatalf("Error starting TCP listener: %v", err)
+		log.Fatalf("Error starting TCP listener on port %s: %v", *listenPort, err)
 	}
 	defer listener.Close()
 
-	log.Printf("Proxy listening on port %s, forwarding to %s:%s", listenPort, remoteAddr, remotePort)
+	log.Printf("Proxy listening on port %s, forwarding to %s:%s", *listenPort, *targetIP, *targetPort)
 
-	// Accept connections continuously.
+	// Accept and handle connections.
 	for {
-		conn, err := listener.Accept()
+		clientConn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
-		go handleConnection(conn, remoteAddr, remotePort)
+		go handleConnection(clientConn, *targetIP, *targetPort)
 	}
 }
