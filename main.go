@@ -1,21 +1,26 @@
 package main
-
 import (
-	"bytes"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
-	"os"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+    "bytes"
+    "encoding/json"
+    "flag"
+    "fmt"
+    "io"
+    "log"
+    "net"
+    "net/http"
+    "os"
+    "strings"
+    "sync"
+    "sync/atomic"
+    "time"
 )
-
+// min returns the smaller of two integers.
+func min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
+}
 // ------------------------
 // Discord embed support
 // ------------------------
