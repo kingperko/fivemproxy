@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -77,137 +76,178 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 }
 
 // ------------------------
-// Global counters and maps for DDoS detection
+// Data structures for advanced DDoS detection
+// ------------------------
+
+type IntervalStats struct {
+	TotalTCP  int64
+	TotalUDP  int64
+	IPCounts  map[string]int64
+	StartTime time.Time
+}
+
+var (
+	statsMutex   sync.Mutex
+	currentStats = IntervalStats{IPCounts: make(map[string]int64), StartTime: time.Now()}
+)
+
+// updateStats updates the current stats for a given IP and protocol.
+func updateStats(ip string, protocol string) {
+	statsMutex.Lock()
+	defer statsMutex.Unlock()
+	if protocol == "tcp" {
+		currentStats.TotalTCP++
+	} else if protocol == "udp" {
+		currentStats.TotalUDP++
+	}
+	currentStats.IPCounts[ip]++
+}
+
+// resetStats resets the interval stats and returns the previous stats.
+func resetStats() IntervalStats {
+	statsMutex.Lock()
+	defer statsMutex.Unlock()
+	prev := currentStats
+	currentStats = IntervalStats{IPCounts: make(map[string]int64), StartTime: time.Now()}
+	return prev
+}
+
+// generateBar returns a simple text bar for a given value.
+func generateBar(value int64, max int64) string {
+	// Scale to a maximum of 10 blocks.
+	blocks := int((float64(value) / float64(max)) * 10)
+	if blocks < 1 {
+		blocks = 1
+	}
+	return strings.Repeat("█", blocks)
+}
+
+// ------------------------
+// Global variables for active TCP tracking and banning
 // ------------------------
 
 var (
-	tcpConnCount   int64    // counts TCP connections in current interval
-	udpPacketCount int64    // counts UDP packets in current interval
-	uniqueIPs      sync.Map // map[string]bool of client IPs seen in current interval
+	activeTCP sync.Map // map[string]bool of IPs with active TCP connections
+	bannedIPs sync.Map // map[string]bool of banned IPs
+)
 
-	// For per-IP event counting
-	ipEventCounts sync.Map // map[string]*int64
-
-	// Banned IPs: if an IP exceeds the per-IP threshold, it is banned.
-	bannedIPs sync.Map // map[string]bool
-
-	// activeTCP tracks IPs with active TCP connections.
-	activeTCP sync.Map // map[string]bool
-
+// For our new system, we do not automatically ban an IP on a single interval.
+var (
 	attackMode      bool
 	attackModeLock  sync.Mutex
-	peakEvents      int64 // peak events in any interval during attack
-	consecutiveSafe int   // number of consecutive intervals below overall threshold
+	lastAttackStats IntervalStats
 )
 
-// Global thresholds.
+// Configuration thresholds (adjust as needed)
 const (
-	thresholdEvents   int64 = 100  // overall events in an interval to trigger DDoS mode (only if >1 unique IP)
-	ipThresholdMulti  int64 = 200  // per-IP threshold when multiple clients exist
-	ipThresholdSingle int64 = 500  // per-IP threshold when only one client is present
+	IntervalDuration   = 10 * time.Second
+	OverallThreshold   = 150  // overall events in an interval to trigger attack mode (if >1 unique IP)
+	SingleIPThreshold  = 400  // if only one unique IP, it must exceed this to be flagged (to avoid banning legitimate solo players)
+	RelativeThreshold  = 0.8  // if an IP produces >80% of events in multi-IP scenario, it’s suspicious
+	DiscordGraphFactor = 10   // divisor to scale the bar graph (adjust for your traffic)
 )
 
-// incrementIPEvent increments the counter for a given IP.
-func incrementIPEvent(ip string) {
-	v, _ := ipEventCounts.LoadOrStore(ip, new(int64))
-	atomic.AddInt64(v.(*int64), 1)
-}
+// processStats analyzes the stats from the interval and performs advanced DDoS screening.
+func processStats(discordWebhook string) {
+	stats := resetStats()
+	total := stats.TotalTCP + stats.TotalUDP
+	uniqueCount := len(stats.IPCounts)
 
-// offender represents an IP and its event count.
-type offender struct {
-	IP    string
-	Count int64
-}
-
-// monitorAttack runs every 5 seconds to check event counts and ban offenders.
-func monitorAttack(discordWebhook string) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		tcp := atomic.SwapInt64(&tcpConnCount, 0)
-		udp := atomic.SwapInt64(&udpPacketCount, 0)
-		total := tcp + udp
-
-		uniqueCount := 0
-		uniqueIPs.Range(func(key, value interface{}) bool {
-			uniqueCount++
-			return true
-		})
-		uniqueIPs = sync.Map{}
-
-		// Build per-IP summary.
-		var offenders []offender
-		ipEventCounts.Range(func(key, value interface{}) bool {
-			count := atomic.LoadInt64(value.(*int64))
-			offenders = append(offenders, offender{
-				IP:    key.(string),
-				Count: count,
-			})
-			return true
-		})
-		ipEventCounts = sync.Map{}
-
-		// Sort offenders descending by count.
-		sort.Slice(offenders, func(i, j int) bool {
-			return offenders[i].Count > offenders[j].Count
-		})
-
-		// Ban IPs based on thresholds.
-		for _, off := range offenders {
-			if uniqueCount > 1 {
-				if off.Count > ipThresholdMulti {
-					bannedIPs.Store(off.IP, true)
-					log.Printf("BANNED: IP %s banned with %d events", off.IP, off.Count)
-				}
-			} else { // single IP scenario
-				if off.Count > ipThresholdSingle {
-					bannedIPs.Store(off.IP, true)
-					log.Printf("BANNED: IP %s banned with %d events (single client)", off.IP, off.Count)
-				}
-			}
-		}
-
-		// Log interval summary.
-		log.Printf("=== Interval Summary ===")
-		log.Printf("TCP: %d | UDP: %d | Total: %d | Unique IPs: %d", tcp, udp, total, uniqueCount)
-		log.Printf("Top Offenders:")
-		for i, off := range offenders {
-			if i >= 3 {
-				break
-			}
-			log.Printf("  %s : %d events", off.IP, off.Count)
-		}
-
-		attackModeLock.Lock()
-		// Trigger attack mode only if there's more than one unique IP.
-		if uniqueCount > 1 && !attackMode && total > thresholdEvents {
-			attackMode = true
-			peakEvents = total
-			consecutiveSafe = 0
-			log.Printf(">>> DDOS attack detected. Server mitigation enabled.")
-			sendDiscordEmbed(discordWebhook, "Server Mitigation Enabled",
-				fmt.Sprintf("DDoS attack detected.\nTotal events: %d\nUnique IPs: %d", total, uniqueCount), 0xff6600)
-		} else if attackMode {
-			if total > peakEvents {
-				peakEvents = total
-			}
-			if total < thresholdEvents {
-				consecutiveSafe++
-			} else {
-				consecutiveSafe = 0
-			}
-			if consecutiveSafe >= 2 {
-				attackMode = false
-				msg := fmt.Sprintf("Attack ended.\nPeak events: %d\nUnique IPs (last interval): %d", peakEvents, uniqueCount)
-				log.Printf(">>> DDOS attack ended. %s", msg)
-				sendDiscordEmbed(discordWebhook, "Attack Ended", msg, 0x00bfff)
-				peakEvents = 0
-				consecutiveSafe = 0
-			}
-		}
-		attackModeLock.Unlock()
+	// Build list of offenders.
+	type ipStat struct {
+		IP    string
+		Count int64
 	}
+	var offenders []ipStat
+	for ip, count := range stats.IPCounts {
+		offenders = append(offenders, ipStat{IP: ip, Count: count})
+	}
+	sort.Slice(offenders, func(i, j int) bool {
+		return offenders[i].Count > offenders[j].Count
+	})
+
+	// Log advanced interval summary.
+	log.Printf("=== Interval Summary ===")
+	log.Printf("Interval Duration: %v", IntervalDuration)
+	log.Printf("TCP: %d | UDP: %d | Total: %d | Unique IPs: %d", stats.TotalTCP, stats.TotalUDP, total, uniqueCount)
+	log.Printf("Top Offenders:")
+	maxCount := int64(1)
+	if len(offenders) > 0 {
+		maxCount = offenders[0].Count
+	}
+	for i, off := range offenders {
+		if i >= 3 {
+			break
+		}
+		bar := generateBar(off.Count, maxCount/DiscordGraphFactor+1)
+		log.Printf("  %s : %d events %s", off.IP, off.Count, bar)
+	}
+
+	// Advanced screening: if there is more than one unique IP, use relative thresholds.
+	var banned []string
+	if uniqueCount > 1 && total > OverallThreshold {
+		// For each IP, if its share exceeds RelativeThreshold, mark it.
+		for _, off := range offenders {
+			share := float64(off.Count) / float64(total)
+			if share > RelativeThreshold {
+				bannedIPs.Store(off.IP, true)
+				banned = append(banned, fmt.Sprintf("%s (%.0f%%)", off.IP, share*100))
+				log.Printf("BANNED: IP %s banned (share: %.0f%%)", off.IP, share*100)
+			}
+		}
+	} else if uniqueCount == 1 {
+		// Single IP scenario.
+		for _, off := range offenders {
+			if off.Count > SingleIPThreshold {
+				bannedIPs.Store(off.IP, true)
+				banned = append(banned, fmt.Sprintf("%s (count: %d)", off.IP, off.Count))
+				log.Printf("BANNED: IP %s banned (single client, count: %d)", off.IP, off.Count)
+			}
+		}
+	}
+
+	// Attack mode detection: if overall total is high, trigger attack mode.
+	attackModeLock.Lock()
+	if uniqueCount > 1 && total > OverallThreshold {
+		if !attackMode {
+			attackMode = true
+			lastAttackStats = stats
+			// Send attack start embed with advanced data.
+			desc := fmt.Sprintf("DDoS attack detected.\nTotal events: %d\nUnique IPs: %d", total, uniqueCount)
+			// Append top offender info.
+			if len(offenders) > 0 {
+				desc += "\nTop Offender: " + offenders[0].IP + fmt.Sprintf(" (%d events)", offenders[0].Count)
+			}
+			// Add a simple bar graph for top 3 offenders.
+			for i, off := range offenders {
+				if i >= 3 {
+					break
+				}
+				bar := generateBar(off.Count, maxCount/DiscordGraphFactor+1)
+				desc += fmt.Sprintf("\n%s : %d events %s", off.IP, off.Count, bar)
+			}
+			log.Printf(">>> DDOS attack detected. Mitigation enabled.")
+			sendDiscordEmbed(discordWebhook, "Server Mitigation Enabled", desc, 0xff6600)
+		}
+	} else {
+		if attackMode {
+			// If traffic drops below threshold for two consecutive intervals, consider attack over.
+			// (For simplicity, we don't count consecutive safe intervals here, but you could add that.)
+			attackMode = false
+			desc := fmt.Sprintf("DDoS attack ended.\nPeak events: %d\nUnique IPs: %d", total, uniqueCount)
+			// Add top offenders.
+			for i, off := range offenders {
+				if i >= 3 {
+					break
+				}
+				bar := generateBar(off.Count, maxCount/DiscordGraphFactor+1)
+				desc += fmt.Sprintf("\n%s : %d events %s", off.IP, off.Count, bar)
+			}
+			log.Printf(">>> DDOS attack ended. %s", desc)
+			sendDiscordEmbed(discordWebhook, "Attack Ended", desc, 0x00bfff)
+		}
+	}
+	attackModeLock.Unlock()
 }
 
 // ------------------------
@@ -219,7 +259,7 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	clientAddr := client.RemoteAddr().String()
 	clientIP := strings.Split(clientAddr, ":")[0]
 
-	// Drop connection if banned.
+	// If banned, drop connection.
 	if _, banned := bannedIPs.Load(clientIP); banned {
 		log.Printf("[TCP] Dropping connection from banned IP %s", clientIP)
 		client.Close()
@@ -227,18 +267,17 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	}
 
 	log.Printf("[TCP] Accepted connection from %s", clientAddr)
-	// Mark IP as active on TCP.
+	// Mark as active.
 	activeTCP.Store(clientIP, true)
 	defer activeTCP.Delete(clientIP)
 
-	atomic.AddInt64(&tcpConnCount, 1)
-	uniqueIPs.Store(clientIP, true)
-	incrementIPEvent(clientIP)
-	defer client.Close()
+	// Update stats.
+	updateStats(clientIP, "tcp")
 
 	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf("[TCP] Error connecting to backend for %s: %v", clientAddr, err)
+		client.Close()
 		return
 	}
 	defer backend.Close()
@@ -316,21 +355,17 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 			log.Printf("[UDP] Error reading: %v", err)
 			continue
 		}
-		atomic.AddInt64(&udpPacketCount, 1)
 		clientKey := clientAddr.String()
 		clientIP := strings.Split(clientKey, ":")[0]
-		uniqueIPs.Store(clientIP, true)
-		// Only count UDP events if there's no active TCP connection from this IP.
+		// Update stats: only count UDP events if no active TCP exists.
 		if _, active := activeTCP.Load(clientIP); !active {
-			incrementIPEvent(clientIP)
+			updateStats(clientIP, "udp")
 		}
-
-		// Drop packet if IP is banned.
+		// Drop packet if banned.
 		if _, banned := bannedIPs.Load(clientIP); banned {
 			log.Printf("[UDP] Dropping packet from banned IP %s", clientIP)
 			continue
 		}
-
 		mu.Lock()
 		entry, found := backendMap[clientKey]
 		if !found {
@@ -382,7 +417,7 @@ func main() {
 	targetIP := flag.String("targetIP", "", "Backend server IP address")
 	targetPort := flag.String("targetPort", "", "Backend server port")
 	listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
-	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL for DDOS alerts (optional)")
+	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL for DDoS alerts (optional)")
 	flag.Parse()
 
 	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
@@ -390,7 +425,93 @@ func main() {
 		os.Exit(1)
 	}
 
-	go monitorAttack(*discordWebhook)
+	// Start advanced monitoring every IntervalDuration.
+	go func() {
+		ticker := time.NewTicker(IntervalDuration)
+		defer ticker.Stop()
+		for range ticker.C {
+			processIntervalStats(*discordWebhook)
+		}
+	}()
+
+	// Start proxies.
 	go startTCPProxy(*listenPort, *targetIP, *targetPort)
 	startUDPProxy(*listenPort, *targetIP, *targetPort)
+}
+
+// processIntervalStats analyzes and resets current interval stats.
+func processIntervalStats(discordWebhook string) {
+	statsMutex.Lock()
+	totalTCP := currentStats.TotalTCP
+	totalUDP := currentStats.TotalUDP
+	ipCounts := currentStats.IPCounts
+	statsMutex.Unlock()
+
+	total := totalTCP + totalUDP
+	uniqueCount := len(ipCounts)
+
+	// Build sorted list of IPs.
+	type ipStat struct {
+		IP    string
+		Count int64
+	}
+	var statsList []ipStat
+	for ip, count := range ipCounts {
+		statsList = append(statsList, ipStat{IP: ip, Count: count})
+	}
+	sort.Slice(statsList, func(i, j int) bool {
+		return statsList[i].Count > statsList[j].Count
+	})
+
+	// Build a textual bar graph for top 3 offenders.
+	graphLines := ""
+	maxCount := int64(1)
+	if len(statsList) > 0 {
+		maxCount = statsList[0].Count
+	}
+	for i, s := range statsList {
+		if i >= 3 {
+			break
+		}
+		bar := strings.Repeat("█", int((float64(s.Count)/float64(maxCount))*10))
+		graphLines += fmt.Sprintf("%s: %d events %s\n", s.IP, s.Count, bar)
+	}
+
+	// Log summary.
+	log.Printf("=== Advanced Interval Summary ===")
+	log.Printf("TCP: %d | UDP: %d | Total: %d | Unique IPs: %d", totalTCP, totalUDP, total, uniqueCount)
+	log.Printf("Top Offenders:\n%s", graphLines)
+
+	// Advanced screening and ban decisions.
+	// For example, if total > OverallThreshold and one IP exceeds 80% of traffic, ban it.
+	attackModeLock.Lock()
+	if uniqueCount > 1 && total > thresholdEvents {
+		for _, s := range statsList {
+			share := float64(s.Count) / float64(total)
+			if share > 0.8 { // more than 80% of traffic
+				bannedIPs.Store(s.IP, true)
+				log.Printf("BANNED: IP %s banned for excessive share (%.0f%%)", s.IP, share*100)
+			}
+		}
+		if !attackMode {
+			attackMode = true
+			lastAttackStats = currentStats
+			desc := fmt.Sprintf("DDoS attack detected.\nTotal events: %d\nUnique IPs: %d\n\nTop Offenders:\n%s", total, uniqueCount, graphLines)
+			log.Printf(">>> DDoS attack detected. Mitigation enabled.")
+			sendDiscordEmbed(discordWebhook, "Server Mitigation Enabled", desc, 0xff6600)
+		}
+	} else {
+		if attackMode {
+			attackMode = false
+			desc := fmt.Sprintf("DDoS attack ended.\nTotal events: %d\nUnique IPs: %d\n\nTop Offenders:\n%s", total, uniqueCount, graphLines)
+			log.Printf(">>> DDoS attack ended. %s", desc)
+			sendDiscordEmbed(discordWebhook, "Attack Ended", desc, 0x00bfff)
+		}
+	}
+	attackModeLock.Unlock()
+
+	// Reset the stats for the next interval.
+	statsMutex.Lock()
+	currentStats = IntervalStats{IPCounts: make(map[string]int64), StartTime: time.Now()}
+	statsMutex.Unlock()
 }
