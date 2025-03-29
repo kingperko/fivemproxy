@@ -88,8 +88,11 @@ var (
 	// For per-IP event counting
 	ipEventCounts sync.Map // map[string]*int64
 
-	// Banned IPs: if an IP exceeds ipThreshold events in an interval, it is banned.
+	// Banned IPs: if an IP exceeds ipThreshold events in a single interval, it is banned.
 	bannedIPs sync.Map // map[string]bool
+
+	// activeTCP tracks IPs with active TCP connections.
+	activeTCP sync.Map // map[string]bool
 
 	attackMode      bool
 	attackModeLock  sync.Mutex
@@ -101,7 +104,6 @@ var (
 const thresholdEvents int64 = 100
 
 // ipThreshold is the per-IP event threshold per interval to ban an IP.
-// Increased from 50 to 200 to avoid banning legitimate traffic.
 const ipThreshold int64 = 200
 
 // incrementIPEvent increments the counter for a given IP.
@@ -219,6 +221,10 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	}
 
 	log.Printf("[TCP] Accepted connection from %s", clientAddr)
+	// Mark this IP as active on TCP.
+	activeTCP.Store(clientIP, true)
+	defer activeTCP.Delete(clientIP)
+
 	atomic.AddInt64(&tcpConnCount, 1)
 	uniqueIPs.Store(clientIP, true)
 	incrementIPEvent(clientIP)
@@ -308,7 +314,10 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 		clientKey := clientAddr.String()
 		clientIP := strings.Split(clientKey, ":")[0]
 		uniqueIPs.Store(clientIP, true)
-		incrementIPEvent(clientIP)
+		// Only count UDP events if the IP is not active on TCP.
+		if _, active := activeTCP.Load(clientIP); !active {
+			incrementIPEvent(clientIP)
+		}
 
 		// Drop packet if IP is banned.
 		if _, banned := bannedIPs.Load(clientIP); banned {
