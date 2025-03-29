@@ -1,234 +1,201 @@
 package main
 
 import (
-	"flag"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"os"
-	"strings"
-	"sync"
-	"time"
+    "flag"
+    "fmt"
+    "io"
+    "log"
+    "net"
+    "os"
+    "strings"
+    "sync"
+    "time"
 )
 
-// min returns the smaller of two integers.
+// We'll reuse some helpers from the original code.
 func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+    if a < b {
+        return a
+    }
+    return b
 }
 
-// TCP Proxy
+// ------------------- TCP Proxy -------------------
 
-// handleTCPConnection forwards data between the TCP client and backend server.
+// handleTCPConnection forwards data between one TCP client and the backend server.
 func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
-	startTime := time.Now()
-	clientIP := strings.Split(client.RemoteAddr().String(), ":")[0]
-	log.Printf("TCP: Accepted connection from %s", clientIP)
-	defer client.Close()
+    startTime := time.Now()
+    clientIP := strings.Split(client.RemoteAddr().String(), ":")[0]
+    log.Printf("TCP: Accepted connection from %s", clientIP)
+    defer client.Close()
 
-	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
-	if err != nil {
-		log.Printf("TCP: Error connecting to backend for %s: %v", clientIP, err)
-		return
-	}
-	defer backend.Close()
+    // Connect to backend server for TCP.
+    backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
+    if err != nil {
+        log.Printf("TCP: Error connecting to backend for %s: %v", clientIP, err)
+        return
+    }
+    defer backend.Close()
 
-	// Read an initial packet (up to 1024 bytes) for logging.
-	client.SetReadDeadline(time.Now().Add(3 * time.Second))
-	initialBuf := make([]byte, 1024)
-	n, err := client.Read(initialBuf)
-	client.SetReadDeadline(time.Time{})
-	if err != nil {
-		log.Printf("TCP: Error reading initial data from %s: %v", clientIP, err)
-		return
-	}
+    // Read an initial packet for logging (not strictly required).
+    client.SetReadDeadline(time.Now().Add(3 * time.Second))
+    buf := make([]byte, 1024)
+    n, err := client.Read(buf)
+    client.SetReadDeadline(time.Time{}) // Remove the deadline.
 
-	initialData := string(initialBuf[:n])
-	log.Printf("TCP: Initial packet from %s: %q", clientIP, initialData[:min(n, 64)])
+    if err == nil && n > 0 {
+        initialData := string(buf[:n])
+        log.Printf("TCP: Initial packet from %s: %q", clientIP, initialData[:min(n, 64)])
+        // Forward that data to the backend.
+        _, _ = backend.Write(buf[:n])
+    } else if err != nil && err != io.EOF {
+        log.Printf("TCP: Error reading initial data from %s: %v", clientIP, err)
+        return
+    }
 
-	// Forward the initial data to the backend.
-	_, err = backend.Write(initialBuf[:n])
-	if err != nil {
-		log.Printf("TCP: Error forwarding initial data from %s: %v", clientIP, err)
-		return
-	}
+    // Bidirectional copy (client <-> backend).
+    done := make(chan struct{}, 2)
+    go func() {
+        io.Copy(backend, client)
+        done <- struct{}{}
+    }()
+    go func() {
+        io.Copy(client, backend)
+        done <- struct{}{}
+    }()
 
-	// Bidirectional copy.
-	done := make(chan struct{}, 2)
-	go func() {
-		io.Copy(backend, client)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(client, backend)
-		done <- struct{}{}
-	}()
-	<-done
-	log.Printf("TCP: Connection from %s closed after %v", clientIP, time.Since(startTime))
+    // Wait until one side closes.
+    <-done
+    log.Printf("TCP: Connection from %s closed after %v", clientIP, time.Since(startTime))
 }
 
-// UDP Proxy
+// startTCPProxy listens on listenPort (TCP) and forwards to targetIP:targetPort.
+func startTCPProxy(listenPort, targetIP, targetPort string) {
+    ln, err := net.Listen("tcp", ":"+listenPort)
+    if err != nil {
+        log.Fatalf("Error starting TCP listener on port %s: %v", listenPort, err)
+    }
+    defer ln.Close()
 
-// udpClient represents a mapping for a UDP client.
-type udpClient struct {
-	backendConn *net.UDPConn
-	clientAddr  *net.UDPAddr
-	lastActive  time.Time
-	ch          chan []byte
+    log.Printf("TCP proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
+
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            log.Printf("TCP: Error accepting connection: %v", err)
+            continue
+        }
+        go handleTCPConnection(conn, targetIP, targetPort)
+    }
 }
 
-var (
-	udpClients   = make(map[string]*udpClient)
-	udpClientsMu sync.Mutex
-)
+// ------------------- UDP Proxy (Naive NAT) -------------------
 
-// handleUDPClient creates a persistent UDP mapping for a client.
-// It reads from a channel (filled by the main UDP loop) and forwards to the backend,
-// then waits for a response to send back to the client.
-func handleUDPClient(clientAddr *net.UDPAddr, listener *net.UDPConn, targetAddr *net.UDPAddr) {
-	clientKey := clientAddr.String()
-
-	backendConn, err := net.DialUDP("udp", nil, targetAddr)
-	if err != nil {
-		log.Printf("UDP: Error dialing backend for client %s: %v", clientKey, err)
-		return
-	}
-
-	ch := make(chan []byte, 100)
-	udpClientsMu.Lock()
-	udpClients[clientKey] = &udpClient{
-		backendConn: backendConn,
-		clientAddr:  clientAddr,
-		lastActive:  time.Now(),
-		ch:          ch,
-	}
-	udpClientsMu.Unlock()
-
-	buf := make([]byte, 2048)
-	// Goroutine: forward packets from client to backend and send response back.
-	go func() {
-		defer backendConn.Close()
-		for {
-			select {
-			case packet, ok := <-ch:
-				if !ok {
-					return
-				}
-				// Forward the packet to backend.
-				_, err := backendConn.Write(packet)
-				if err != nil {
-					log.Printf("UDP: Error writing to backend for %s: %v", clientKey, err)
-					continue
-				}
-				// Set a read deadline for a response.
-				backendConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-				n, err := backendConn.Read(buf)
-				if err == nil && n > 0 {
-					// Send response back to client.
-					_, err = listener.WriteToUDP(buf[:n], clientAddr)
-					if err != nil {
-						log.Printf("UDP: Error writing response to client %s: %v", clientKey, err)
-					}
-				}
-			case <-time.After(30 * time.Second):
-				// If inactive for 30 seconds, remove the client mapping.
-				udpClientsMu.Lock()
-				delete(udpClients, clientKey)
-				udpClientsMu.Unlock()
-				return
-			}
-		}
-	}()
+// We track each client IP:port => a dedicated UDP connection to the backend.
+type udpMapEntry struct {
+    backendConn *net.UDPConn
+    lastSeen    time.Time
 }
 
-// udpProxy continuously reads UDP packets and dispatches them to the appropriate client handler.
-func udpProxy(listener *net.UDPConn, targetAddr *net.UDPAddr) {
-	buf := make([]byte, 2048)
-	for {
-		n, clientAddr, err := listener.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("UDP: Error reading packet: %v", err)
-			continue
-		}
+// handleUDPProxy listens on listenPort (UDP) and forwards data to targetIP:targetPort.
+// Each unique client IP:port gets its own backend UDP connection.
+func startUDPProxy(listenPort, targetIP, targetPort string) {
+    // Resolve the address we'll listen on for UDP.
+    addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
+    if err != nil {
+        log.Fatalf("UDP: Error resolving UDP addr: %v", err)
+    }
 
-		clientKey := clientAddr.String()
-		udpClientsMu.Lock()
-		client, exists := udpClients[clientKey]
-		if exists {
-			client.lastActive = time.Now()
-		} else {
-			go handleUDPClient(clientAddr, listener, targetAddr)
-			// Allow a short delay for the new client mapping to be created.
-			time.Sleep(10 * time.Millisecond)
-			client = udpClients[clientKey]
-		}
-		udpClientsMu.Unlock()
+    // Listen for incoming UDP packets.
+    conn, err := net.ListenUDP("udp", addr)
+    if err != nil {
+        log.Fatalf("UDP: Error listening on port %s: %v", listenPort, err)
+    }
+    defer conn.Close()
 
-		// Send a copy of the packet to the client's channel.
-		if client != nil {
-			packet := make([]byte, n)
-			copy(packet, buf[:n])
-			select {
-			case client.ch <- packet:
-			default:
-				// If the channel is full, drop the packet.
-			}
-		}
-	}
+    log.Printf("UDP proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
+
+    // We'll store client => backendConn in a map, so multiple clients can connect.
+    var (
+        backendMap = make(map[string]*udpMapEntry)
+        mu         sync.Mutex
+    )
+
+    buf := make([]byte, 2048)
+
+    for {
+        n, clientAddr, err := conn.ReadFromUDP(buf)
+        if err != nil {
+            log.Printf("UDP: Error reading: %v", err)
+            continue
+        }
+
+        clientKey := clientAddr.String()
+
+        mu.Lock()
+        entry, found := backendMap[clientKey]
+        if !found {
+            // Create a new backend connection for this client.
+            targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
+            if err != nil {
+                log.Printf("UDP: Error resolving backend address: %v", err)
+                mu.Unlock()
+                continue
+            }
+            bc, err := net.DialUDP("udp", nil, targetAddr)
+            if err != nil {
+                log.Printf("UDP: Error dialing backend for %s: %v", clientKey, err)
+                mu.Unlock()
+                continue
+            }
+
+            entry = &udpMapEntry{
+                backendConn: bc,
+                lastSeen:    time.Now(),
+            }
+            backendMap[clientKey] = entry
+
+            // Start a goroutine to read from the backend and forward to the client.
+            go func(client *net.UDPAddr, backendConn *net.UDPConn) {
+                bBuf := make([]byte, 2048)
+                for {
+                    backendConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+                    n2, _, err2 := backendConn.ReadFromUDP(bBuf)
+                    if err2 != nil {
+                        // Usually means the backendConn closed or timed out.
+                        log.Printf("UDP: Closing connection for %s: %v", client.String(), err2)
+                        backendConn.Close()
+                        mu.Lock()
+                        delete(backendMap, client.String())
+                        mu.Unlock()
+                        return
+                    }
+                    // Forward data back to the client.
+                    conn.WriteToUDP(bBuf[:n2], client)
+                }
+            }(clientAddr, bc)
+        }
+        // Update lastSeen and forward the data to the backend.
+        entry.lastSeen = time.Now()
+        _, _ = entry.backendConn.Write(buf[:n])
+        mu.Unlock()
+    }
 }
+
+// ------------------- main -------------------
 
 func main() {
-	// Define flags.
-	targetIP := flag.String("targetIP", "", "Backend server IP address")
-	targetPort := flag.String("targetPort", "", "Backend server port")
-	listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
-	flag.Parse()
+    targetIP := flag.String("targetIP", "", "Backend server IP address")
+    targetPort := flag.String("targetPort", "", "Backend server port")
+    listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
+    flag.Parse()
 
-	// Ensure required flags are provided.
-	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port>\n", os.Args[0])
-		os.Exit(1)
-	}
+    if *targetIP == "" || *targetPort == "" || *listenPort == "" {
+        fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port>\n", os.Args[0])
+        os.Exit(1)
+    }
 
-	// Start TCP listener.
-	tcpListener, err := net.Listen("tcp", ":"+*listenPort)
-	if err != nil {
-		log.Fatalf("Error starting TCP listener on port %s: %v", *listenPort, err)
-	}
-	defer tcpListener.Close()
-	log.Printf("TCP proxy listening on port %s, forwarding to %s:%s", *listenPort, *targetIP, *targetPort)
-
-	// Start UDP listener.
-	udpAddr, err := net.ResolveUDPAddr("udp", ":"+*listenPort)
-	if err != nil {
-		log.Fatalf("Error resolving UDP address on port %s: %v", *listenPort, err)
-	}
-	udpListener, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Fatalf("Error starting UDP listener on port %s: %v", *listenPort, err)
-	}
-	defer udpListener.Close()
-	log.Printf("UDP proxy listening on port %s, forwarding to %s:%s", *listenPort, *targetIP, *targetPort)
-
-	// Resolve target UDP address.
-	targetUDPAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(*targetIP, *targetPort))
-	if err != nil {
-		log.Fatalf("Error resolving target UDP address: %v", err)
-	}
-
-	// Start UDP proxy in a goroutine.
-	go udpProxy(udpListener, targetUDPAddr)
-
-	// Accept and handle TCP connections.
-	for {
-		conn, err := tcpListener.Accept()
-		if err != nil {
-			log.Printf("TCP: Error accepting connection: %v", err)
-			continue
-		}
-		go handleTCPConnection(conn, *targetIP, *targetPort)
-	}
+    // Start both TCP and UDP proxies on the same port.
+    go startTCPProxy(*listenPort, *targetIP, *targetPort)
+    startUDPProxy(*listenPort, *targetIP, *targetPort)
 }
