@@ -88,7 +88,7 @@ var (
 	// For per-IP event counting
 	ipEventCounts sync.Map // map[string]*int64
 
-	// Banned IPs: if an IP exceeds ipThreshold events in a single interval, it is banned.
+	// Banned IPs: if an IP exceeds the per-IP threshold, it is banned.
 	bannedIPs sync.Map // map[string]bool
 
 	// activeTCP tracks IPs with active TCP connections.
@@ -96,15 +96,16 @@ var (
 
 	attackMode      bool
 	attackModeLock  sync.Mutex
-	peakEvents      int64 // peak events (TCP+UDP) in any interval during attack
+	peakEvents      int64 // peak events in any interval during attack
 	consecutiveSafe int   // number of consecutive intervals below overall threshold
 )
 
-// threshold for overall events in an interval to trigger DDoS mode.
-const thresholdEvents int64 = 100
-
-// ipThreshold is the per-IP event threshold per interval to ban an IP.
-const ipThreshold int64 = 200
+// Global thresholds.
+const (
+	thresholdEvents   int64 = 100  // overall events in an interval to trigger DDoS mode (only if >1 unique IP)
+	ipThresholdMulti  int64 = 200  // per-IP threshold when multiple clients exist
+	ipThresholdSingle int64 = 500  // per-IP threshold when only one client is present
+)
 
 // incrementIPEvent increments the counter for a given IP.
 func incrementIPEvent(ip string) {
@@ -118,17 +119,16 @@ type offender struct {
 	Count int64
 }
 
+// monitorAttack runs every 5 seconds to check event counts and ban offenders.
 func monitorAttack(discordWebhook string) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Get and reset overall counters.
 		tcp := atomic.SwapInt64(&tcpConnCount, 0)
 		udp := atomic.SwapInt64(&udpPacketCount, 0)
 		total := tcp + udp
 
-		// Count unique IPs.
 		uniqueCount := 0
 		uniqueIPs.Range(func(key, value interface{}) bool {
 			uniqueCount++
@@ -146,7 +146,6 @@ func monitorAttack(discordWebhook string) {
 			})
 			return true
 		})
-		// Clear ipEventCounts for next interval.
 		ipEventCounts = sync.Map{}
 
 		// Sort offenders descending by count.
@@ -154,15 +153,22 @@ func monitorAttack(discordWebhook string) {
 			return offenders[i].Count > offenders[j].Count
 		})
 
-		// Ban IPs that exceed ipThreshold.
+		// Ban IPs based on thresholds.
 		for _, off := range offenders {
-			if off.Count > ipThreshold {
-				bannedIPs.Store(off.IP, true)
-				log.Printf("BANNED: IP %s banned with %d events", off.IP, off.Count)
+			if uniqueCount > 1 {
+				if off.Count > ipThresholdMulti {
+					bannedIPs.Store(off.IP, true)
+					log.Printf("BANNED: IP %s banned with %d events", off.IP, off.Count)
+				}
+			} else { // single IP scenario
+				if off.Count > ipThresholdSingle {
+					bannedIPs.Store(off.IP, true)
+					log.Printf("BANNED: IP %s banned with %d events (single client)", off.IP, off.Count)
+				}
 			}
 		}
 
-		// Log interval summary with top 3 offenders.
+		// Log interval summary.
 		log.Printf("=== Interval Summary ===")
 		log.Printf("TCP: %d | UDP: %d | Total: %d | Unique IPs: %d", tcp, udp, total, uniqueCount)
 		log.Printf("Top Offenders:")
@@ -174,8 +180,8 @@ func monitorAttack(discordWebhook string) {
 		}
 
 		attackModeLock.Lock()
-		// Check overall threshold for attack mode.
-		if !attackMode && total > thresholdEvents {
+		// Trigger attack mode only if there's more than one unique IP.
+		if uniqueCount > 1 && !attackMode && total > thresholdEvents {
 			attackMode = true
 			peakEvents = total
 			consecutiveSafe = 0
@@ -191,11 +197,11 @@ func monitorAttack(discordWebhook string) {
 			} else {
 				consecutiveSafe = 0
 			}
-			// If safe for 2 intervals, consider attack over.
 			if consecutiveSafe >= 2 {
 				attackMode = false
-				log.Printf(">>> DDOS attack ended. Peak events: %d", peakEvents)
-				// Do NOT send an embed on attack end.
+				msg := fmt.Sprintf("Attack ended.\nPeak events: %d\nUnique IPs (last interval): %d", peakEvents, uniqueCount)
+				log.Printf(">>> DDOS attack ended. %s", msg)
+				sendDiscordEmbed(discordWebhook, "Attack Ended", msg, 0x00bfff)
 				peakEvents = 0
 				consecutiveSafe = 0
 			}
@@ -221,7 +227,7 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	}
 
 	log.Printf("[TCP] Accepted connection from %s", clientAddr)
-	// Mark this IP as active on TCP.
+	// Mark IP as active on TCP.
 	activeTCP.Store(clientIP, true)
 	defer activeTCP.Delete(clientIP)
 
@@ -314,7 +320,7 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 		clientKey := clientAddr.String()
 		clientIP := strings.Split(clientKey, ":")[0]
 		uniqueIPs.Store(clientIP, true)
-		// Only count UDP events if the IP is not active on TCP.
+		// Only count UDP events if there's no active TCP connection from this IP.
 		if _, active := activeTCP.Load(clientIP); !active {
 			incrementIPEvent(clientIP)
 		}
