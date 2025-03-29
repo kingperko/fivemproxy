@@ -93,7 +93,7 @@ var (
 
 	attackMode      bool
 	attackModeLock  sync.Mutex
-	peakEvents      int64 // peak events in any interval during attack
+	peakEvents      int64 // peak events (TCP+UDP) in any interval during attack
 	consecutiveSafe int   // number of consecutive intervals below overall threshold
 )
 
@@ -101,17 +101,14 @@ var (
 const thresholdEvents int64 = 100
 
 // ipThreshold is the per-IP event threshold per interval to ban an IP.
-const ipThreshold int64 = 50
+// Increased from 50 to 200 to avoid banning legitimate traffic.
+const ipThreshold int64 = 200
 
 // incrementIPEvent increments the counter for a given IP.
 func incrementIPEvent(ip string) {
 	v, _ := ipEventCounts.LoadOrStore(ip, new(int64))
 	atomic.AddInt64(v.(*int64), 1)
 }
-
-// ------------------------
-// Monitor Attack and Ban Offenders
-// ------------------------
 
 // offender represents an IP and its event count.
 type offender struct {
