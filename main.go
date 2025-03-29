@@ -1,26 +1,30 @@
 package main
+
 import (
-    "bytes"
-    "encoding/json"
-    "flag"
-    "fmt"
-    "io"
-    "log"
-    "net"
-    "net/http"
-    "os"
-    "strings"
-    "sync"
-    "sync/atomic"
-    "time"
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
+
 // min returns the smaller of two integers.
 func min(a, b int) int {
-    if a < b {
-        return a
-    }
-    return b
+	if a < b {
+		return a
+	}
+	return b
 }
+
 // ------------------------
 // Discord embed support
 // ------------------------
@@ -73,30 +77,54 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 }
 
 // ------------------------
-// Global counters for attack detection
+// Global counters and maps for DDoS detection
 // ------------------------
 
 var (
-	tcpConnCount  int64 // counts TCP connections in current interval
-	udpPacketCount int64 // counts UDP packets in current interval
-	uniqueIPs     sync.Map // map[string]bool of client IPs seen in current interval
+	tcpConnCount   int64    // counts TCP connections in current interval
+	udpPacketCount int64    // counts UDP packets in current interval
+	uniqueIPs      sync.Map // map[string]bool of client IPs seen in current interval
 
-	attackMode       bool
-	attackModeLock   sync.Mutex
-	peakEvents       int64 // peak events (TCP+UDP) in any interval during attack
-	consecutiveSafe  int   // number of consecutive intervals below threshold
+	// For per-IP event counting
+	ipEventCounts sync.Map // map[string]*int64
+
+	// Banned IPs: if an IP exceeds ipThreshold events in an interval, it is banned.
+	bannedIPs sync.Map // map[string]bool
+
+	attackMode      bool
+	attackModeLock  sync.Mutex
+	peakEvents      int64 // peak events in any interval during attack
+	consecutiveSafe int   // number of consecutive intervals below overall threshold
 )
 
-// threshold: if total events exceed this in a 5-second window, consider it an attack.
-// Adjust as needed.
+// threshold for overall events in an interval to trigger DDoS mode.
 const thresholdEvents int64 = 100
 
-// monitorAttack runs every 5 seconds to check event counts.
+// ipThreshold is the per-IP event threshold per interval to ban an IP.
+const ipThreshold int64 = 50
+
+// incrementIPEvent increments the counter for a given IP.
+func incrementIPEvent(ip string) {
+	v, _ := ipEventCounts.LoadOrStore(ip, new(int64))
+	atomic.AddInt64(v.(*int64), 1)
+}
+
+// ------------------------
+// Monitor Attack and Ban Offenders
+// ------------------------
+
+// offender represents an IP and its event count.
+type offender struct {
+	IP    string
+	Count int64
+}
+
 func monitorAttack(discordWebhook string) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
 	for range ticker.C {
-		// Read and reset counters atomically.
+		// Get and reset overall counters.
 		tcp := atomic.SwapInt64(&tcpConnCount, 0)
 		udp := atomic.SwapInt64(&udpPacketCount, 0)
 		total := tcp + udp
@@ -107,21 +135,54 @@ func monitorAttack(discordWebhook string) {
 			uniqueCount++
 			return true
 		})
-		// Clear unique IPs for next interval.
 		uniqueIPs = sync.Map{}
 
+		// Build per-IP summary.
+		var offenders []offender
+		ipEventCounts.Range(func(key, value interface{}) bool {
+			count := atomic.LoadInt64(value.(*int64))
+			offenders = append(offenders, offender{
+				IP:    key.(string),
+				Count: count,
+			})
+			return true
+		})
+		// Clear ipEventCounts for next interval.
+		ipEventCounts = sync.Map{}
+
+		// Sort offenders descending by count.
+		sort.Slice(offenders, func(i, j int) bool {
+			return offenders[i].Count > offenders[j].Count
+		})
+
+		// Ban IPs that exceed ipThreshold.
+		for _, off := range offenders {
+			if off.Count > ipThreshold {
+				bannedIPs.Store(off.IP, true)
+				log.Printf("BANNED: IP %s banned with %d events", off.IP, off.Count)
+			}
+		}
+
+		// Log interval summary with top 3 offenders.
 		log.Printf("=== Interval Summary ===")
-		log.Printf("TCP connections: %d | UDP packets: %d | Total events: %d | Unique IPs: %d",
-			tcp, udp, total, uniqueCount)
+		log.Printf("TCP: %d | UDP: %d | Total: %d | Unique IPs: %d", tcp, udp, total, uniqueCount)
+		log.Printf("Top Offenders:")
+		for i, off := range offenders {
+			if i >= 3 {
+				break
+			}
+			log.Printf("  %s : %d events", off.IP, off.Count)
+		}
 
 		attackModeLock.Lock()
+		// Check overall threshold for attack mode.
 		if !attackMode && total > thresholdEvents {
 			attackMode = true
 			peakEvents = total
 			consecutiveSafe = 0
-			log.Printf(">>> Server mitigation enabled: High load detected. DDOS attack suspected.")
+			log.Printf(">>> DDOS attack detected. Server mitigation enabled.")
 			sendDiscordEmbed(discordWebhook, "Server Mitigation Enabled",
-				"You are currently receiving a DDoS attack. We will let you know when it’s over.", 0xff6600)
+				fmt.Sprintf("DDoS attack detected.\nTotal events: %d\nUnique IPs: %d", total, uniqueCount), 0xff6600)
 		} else if attackMode {
 			if total > peakEvents {
 				peakEvents = total
@@ -134,9 +195,8 @@ func monitorAttack(discordWebhook string) {
 			// If safe for 2 intervals, consider attack over.
 			if consecutiveSafe >= 2 {
 				attackMode = false
-				msg := fmt.Sprintf("Attack ended.\nPeak events in an interval: %d\nUnique IPs (last interval): %d", peakEvents, uniqueCount)
-				log.Printf(">>> DDOS attack mitigated. %s", msg)
-				sendDiscordEmbed(discordWebhook, "Attack Ended", msg, 0x00bfff)
+				log.Printf(">>> DDOS attack ended. Peak events: %d", peakEvents)
+				// Do NOT send an embed on attack end.
 				peakEvents = 0
 				consecutiveSafe = 0
 			}
@@ -153,9 +213,18 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	startTime := time.Now()
 	clientAddr := client.RemoteAddr().String()
 	clientIP := strings.Split(clientAddr, ":")[0]
+
+	// Drop connection if banned.
+	if _, banned := bannedIPs.Load(clientIP); banned {
+		log.Printf("[TCP] Dropping connection from banned IP %s", clientIP)
+		client.Close()
+		return
+	}
+
 	log.Printf("[TCP] Accepted connection from %s", clientAddr)
 	atomic.AddInt64(&tcpConnCount, 1)
 	uniqueIPs.Store(clientIP, true)
+	incrementIPEvent(clientIP)
 	defer client.Close()
 
 	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
@@ -165,11 +234,10 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	}
 	defer backend.Close()
 
-	// Optionally, read an initial packet (for logging)
 	client.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1024)
 	n, err := client.Read(buf)
-	client.SetReadDeadline(time.Time{}) // clear deadline
+	client.SetReadDeadline(time.Time{})
 	if err == nil && n > 0 {
 		initialData := string(buf[:n])
 		log.Printf("[TCP] Initial packet from %s: %q", clientAddr, initialData[:min(n, 64)])
@@ -213,7 +281,7 @@ func startTCPProxy(listenPort, targetIP, targetPort string) {
 // UDP Proxy Section (Naive NAT style)
 // ------------------------
 
-type udpMapEntry struct {
+type udpEntry struct {
 	backendConn *net.UDPConn
 	lastSeen    time.Time
 }
@@ -230,7 +298,7 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 	defer conn.Close()
 	log.Printf("[UDP] Proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
 
-	backendMap := make(map[string]*udpMapEntry)
+	backendMap := make(map[string]*udpEntry)
 	var mu sync.Mutex
 	buf := make([]byte, 2048)
 	for {
@@ -241,7 +309,15 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 		}
 		atomic.AddInt64(&udpPacketCount, 1)
 		clientKey := clientAddr.String()
-		uniqueIPs.Store(strings.Split(clientKey, ":")[0], true)
+		clientIP := strings.Split(clientKey, ":")[0]
+		uniqueIPs.Store(clientIP, true)
+		incrementIPEvent(clientIP)
+
+		// Drop packet if IP is banned.
+		if _, banned := bannedIPs.Load(clientIP); banned {
+			log.Printf("[UDP] Dropping packet from banned IP %s", clientIP)
+			continue
+		}
 
 		mu.Lock()
 		entry, found := backendMap[clientKey]
@@ -258,7 +334,7 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 				mu.Unlock()
 				continue
 			}
-			entry = &udpMapEntry{
+			entry = &udpEntry{
 				backendConn: bc,
 				lastSeen:    time.Now(),
 			}
@@ -278,7 +354,7 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 					}
 					conn.WriteToUDP(bBuf[:n2], client)
 				}
-			}(clientAddr, bc, clientKey)
+			}(clientAddr, entry.backendConn, clientKey)
 		}
 		entry.lastSeen = time.Now()
 		_, _ = entry.backendConn.Write(buf[:n])
@@ -291,7 +367,6 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 // ------------------------
 
 func main() {
-	// Parse command-line flags.
 	targetIP := flag.String("targetIP", "", "Backend server IP address")
 	targetPort := flag.String("targetPort", "", "Backend server port")
 	listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
@@ -303,10 +378,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start attack monitoring in the background.
 	go monitorAttack(*discordWebhook)
-
-	// Start both TCP and UDP proxies on the same port.
 	go startTCPProxy(*listenPort, *targetIP, *targetPort)
 	startUDPProxy(*listenPort, *targetIP, *targetPort)
 }
