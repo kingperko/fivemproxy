@@ -1,201 +1,307 @@
 package main
 
 import (
-    "flag"
-    "fmt"
-    "io"
-    "log"
-    "net"
-    "os"
-    "strings"
-    "sync"
-    "time"
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
-// We'll reuse some helpers from the original code.
-func min(a, b int) int {
-    if a < b {
-        return a
-    }
-    return b
+// ------------------------
+// Discord embed support
+// ------------------------
+
+type discordEmbed struct {
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	Color       int    `json:"color,omitempty"`
 }
 
-// ------------------- TCP Proxy -------------------
+type discordWebhookBody struct {
+	Username string         `json:"username,omitempty"`
+	Embeds   []discordEmbed `json:"embeds"`
+}
 
-// handleTCPConnection forwards data between one TCP client and the backend server.
+func sendDiscordEmbed(webhookURL, title, description string, color int) {
+	if webhookURL == "" {
+		return // no webhook configured
+	}
+	embed := discordEmbed{
+		Title:       title,
+		Description: description,
+		Color:       color,
+	}
+	payload := discordWebhookBody{
+		Username: "Proxy DDOS Monitor",
+		Embeds:   []discordEmbed{embed},
+	}
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[DISCORD] Error marshaling embed JSON: %v", err)
+		return
+	}
+	req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("[DISCORD] Error creating Discord request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[DISCORD] Error sending to Discord: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		log.Printf("[DISCORD] Discord webhook returned status: %d", resp.StatusCode)
+	}
+}
+
+// ------------------------
+// Global counters for attack detection
+// ------------------------
+
+var (
+	tcpConnCount  int64 // counts TCP connections in current interval
+	udpPacketCount int64 // counts UDP packets in current interval
+	uniqueIPs     sync.Map // map[string]bool of client IPs seen in current interval
+
+	attackMode       bool
+	attackModeLock   sync.Mutex
+	peakEvents       int64 // peak events (TCP+UDP) in any interval during attack
+	consecutiveSafe  int   // number of consecutive intervals below threshold
+)
+
+// threshold: if total events exceed this in a 5-second window, consider it an attack.
+// Adjust as needed.
+const thresholdEvents int64 = 100
+
+// monitorAttack runs every 5 seconds to check event counts.
+func monitorAttack(discordWebhook string) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		// Read and reset counters atomically.
+		tcp := atomic.SwapInt64(&tcpConnCount, 0)
+		udp := atomic.SwapInt64(&udpPacketCount, 0)
+		total := tcp + udp
+
+		// Count unique IPs.
+		uniqueCount := 0
+		uniqueIPs.Range(func(key, value interface{}) bool {
+			uniqueCount++
+			return true
+		})
+		// Clear unique IPs for next interval.
+		uniqueIPs = sync.Map{}
+
+		log.Printf("=== Interval Summary ===")
+		log.Printf("TCP connections: %d | UDP packets: %d | Total events: %d | Unique IPs: %d",
+			tcp, udp, total, uniqueCount)
+
+		attackModeLock.Lock()
+		if !attackMode && total > thresholdEvents {
+			attackMode = true
+			peakEvents = total
+			consecutiveSafe = 0
+			log.Printf(">>> Server mitigation enabled: High load detected. DDOS attack suspected.")
+			sendDiscordEmbed(discordWebhook, "Server Mitigation Enabled",
+				"You are currently receiving a DDoS attack. We will let you know when it’s over.", 0xff6600)
+		} else if attackMode {
+			if total > peakEvents {
+				peakEvents = total
+			}
+			if total < thresholdEvents {
+				consecutiveSafe++
+			} else {
+				consecutiveSafe = 0
+			}
+			// If safe for 2 intervals, consider attack over.
+			if consecutiveSafe >= 2 {
+				attackMode = false
+				msg := fmt.Sprintf("Attack ended.\nPeak events in an interval: %d\nUnique IPs (last interval): %d", peakEvents, uniqueCount)
+				log.Printf(">>> DDOS attack mitigated. %s", msg)
+				sendDiscordEmbed(discordWebhook, "Attack Ended", msg, 0x00bfff)
+				peakEvents = 0
+				consecutiveSafe = 0
+			}
+		}
+		attackModeLock.Unlock()
+	}
+}
+
+// ------------------------
+// TCP Proxy Section
+// ------------------------
+
 func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
-    startTime := time.Now()
-    clientIP := strings.Split(client.RemoteAddr().String(), ":")[0]
-    log.Printf("TCP: Accepted connection from %s", clientIP)
-    defer client.Close()
+	startTime := time.Now()
+	clientAddr := client.RemoteAddr().String()
+	clientIP := strings.Split(clientAddr, ":")[0]
+	log.Printf("[TCP] Accepted connection from %s", clientAddr)
+	atomic.AddInt64(&tcpConnCount, 1)
+	uniqueIPs.Store(clientIP, true)
+	defer client.Close()
 
-    // Connect to backend server for TCP.
-    backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
-    if err != nil {
-        log.Printf("TCP: Error connecting to backend for %s: %v", clientIP, err)
-        return
-    }
-    defer backend.Close()
+	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
+	if err != nil {
+		log.Printf("[TCP] Error connecting to backend for %s: %v", clientAddr, err)
+		return
+	}
+	defer backend.Close()
 
-    // Read an initial packet for logging (not strictly required).
-    client.SetReadDeadline(time.Now().Add(3 * time.Second))
-    buf := make([]byte, 1024)
-    n, err := client.Read(buf)
-    client.SetReadDeadline(time.Time{}) // Remove the deadline.
+	// Optionally, read an initial packet (for logging)
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 1024)
+	n, err := client.Read(buf)
+	client.SetReadDeadline(time.Time{}) // clear deadline
+	if err == nil && n > 0 {
+		initialData := string(buf[:n])
+		log.Printf("[TCP] Initial packet from %s: %q", clientAddr, initialData[:min(n, 64)])
+		_, _ = backend.Write(buf[:n])
+	} else if err != nil && err != io.EOF {
+		log.Printf("[TCP] Error reading initial data from %s: %v", clientAddr, err)
+		return
+	}
 
-    if err == nil && n > 0 {
-        initialData := string(buf[:n])
-        log.Printf("TCP: Initial packet from %s: %q", clientIP, initialData[:min(n, 64)])
-        // Forward that data to the backend.
-        _, _ = backend.Write(buf[:n])
-    } else if err != nil && err != io.EOF {
-        log.Printf("TCP: Error reading initial data from %s: %v", clientIP, err)
-        return
-    }
-
-    // Bidirectional copy (client <-> backend).
-    done := make(chan struct{}, 2)
-    go func() {
-        io.Copy(backend, client)
-        done <- struct{}{}
-    }()
-    go func() {
-        io.Copy(client, backend)
-        done <- struct{}{}
-    }()
-
-    // Wait until one side closes.
-    <-done
-    log.Printf("TCP: Connection from %s closed after %v", clientIP, time.Since(startTime))
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(backend, client)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(client, backend)
+		done <- struct{}{}
+	}()
+	<-done
+	log.Printf("[TCP] Connection from %s closed after %v", clientAddr, time.Since(startTime))
 }
 
-// startTCPProxy listens on listenPort (TCP) and forwards to targetIP:targetPort.
 func startTCPProxy(listenPort, targetIP, targetPort string) {
-    ln, err := net.Listen("tcp", ":"+listenPort)
-    if err != nil {
-        log.Fatalf("Error starting TCP listener on port %s: %v", listenPort, err)
-    }
-    defer ln.Close()
-
-    log.Printf("TCP proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
-
-    for {
-        conn, err := ln.Accept()
-        if err != nil {
-            log.Printf("TCP: Error accepting connection: %v", err)
-            continue
-        }
-        go handleTCPConnection(conn, targetIP, targetPort)
-    }
+	ln, err := net.Listen("tcp", ":"+listenPort)
+	if err != nil {
+		log.Fatalf("[TCP] Error starting TCP listener on port %s: %v", listenPort, err)
+	}
+	defer ln.Close()
+	log.Printf("[TCP] Proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("[TCP] Error accepting connection: %v", err)
+			continue
+		}
+		go handleTCPConnection(conn, targetIP, targetPort)
+	}
 }
 
-// ------------------- UDP Proxy (Naive NAT) -------------------
+// ------------------------
+// UDP Proxy Section (Naive NAT style)
+// ------------------------
 
-// We track each client IP:port => a dedicated UDP connection to the backend.
 type udpMapEntry struct {
-    backendConn *net.UDPConn
-    lastSeen    time.Time
+	backendConn *net.UDPConn
+	lastSeen    time.Time
 }
 
-// handleUDPProxy listens on listenPort (UDP) and forwards data to targetIP:targetPort.
-// Each unique client IP:port gets its own backend UDP connection.
 func startUDPProxy(listenPort, targetIP, targetPort string) {
-    // Resolve the address we'll listen on for UDP.
-    addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
-    if err != nil {
-        log.Fatalf("UDP: Error resolving UDP addr: %v", err)
-    }
+	addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
+	if err != nil {
+		log.Fatalf("[UDP] Error resolving UDP address: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Fatalf("[UDP] Error listening on UDP port %s: %v", listenPort, err)
+	}
+	defer conn.Close()
+	log.Printf("[UDP] Proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
 
-    // Listen for incoming UDP packets.
-    conn, err := net.ListenUDP("udp", addr)
-    if err != nil {
-        log.Fatalf("UDP: Error listening on port %s: %v", listenPort, err)
-    }
-    defer conn.Close()
+	backendMap := make(map[string]*udpMapEntry)
+	var mu sync.Mutex
+	buf := make([]byte, 2048)
+	for {
+		n, clientAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("[UDP] Error reading: %v", err)
+			continue
+		}
+		atomic.AddInt64(&udpPacketCount, 1)
+		clientKey := clientAddr.String()
+		uniqueIPs.Store(strings.Split(clientKey, ":")[0], true)
 
-    log.Printf("UDP proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
-
-    // We'll store client => backendConn in a map, so multiple clients can connect.
-    var (
-        backendMap = make(map[string]*udpMapEntry)
-        mu         sync.Mutex
-    )
-
-    buf := make([]byte, 2048)
-
-    for {
-        n, clientAddr, err := conn.ReadFromUDP(buf)
-        if err != nil {
-            log.Printf("UDP: Error reading: %v", err)
-            continue
-        }
-
-        clientKey := clientAddr.String()
-
-        mu.Lock()
-        entry, found := backendMap[clientKey]
-        if !found {
-            // Create a new backend connection for this client.
-            targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
-            if err != nil {
-                log.Printf("UDP: Error resolving backend address: %v", err)
-                mu.Unlock()
-                continue
-            }
-            bc, err := net.DialUDP("udp", nil, targetAddr)
-            if err != nil {
-                log.Printf("UDP: Error dialing backend for %s: %v", clientKey, err)
-                mu.Unlock()
-                continue
-            }
-
-            entry = &udpMapEntry{
-                backendConn: bc,
-                lastSeen:    time.Now(),
-            }
-            backendMap[clientKey] = entry
-
-            // Start a goroutine to read from the backend and forward to the client.
-            go func(client *net.UDPAddr, backendConn *net.UDPConn) {
-                bBuf := make([]byte, 2048)
-                for {
-                    backendConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-                    n2, _, err2 := backendConn.ReadFromUDP(bBuf)
-                    if err2 != nil {
-                        // Usually means the backendConn closed or timed out.
-                        log.Printf("UDP: Closing connection for %s: %v", client.String(), err2)
-                        backendConn.Close()
-                        mu.Lock()
-                        delete(backendMap, client.String())
-                        mu.Unlock()
-                        return
-                    }
-                    // Forward data back to the client.
-                    conn.WriteToUDP(bBuf[:n2], client)
-                }
-            }(clientAddr, bc)
-        }
-        // Update lastSeen and forward the data to the backend.
-        entry.lastSeen = time.Now()
-        _, _ = entry.backendConn.Write(buf[:n])
-        mu.Unlock()
-    }
+		mu.Lock()
+		entry, found := backendMap[clientKey]
+		if !found {
+			targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
+			if err != nil {
+				log.Printf("[UDP] Error resolving backend address: %v", err)
+				mu.Unlock()
+				continue
+			}
+			bc, err := net.DialUDP("udp", nil, targetAddr)
+			if err != nil {
+				log.Printf("[UDP] Error dialing backend for %s: %v", clientKey, err)
+				mu.Unlock()
+				continue
+			}
+			entry = &udpMapEntry{
+				backendConn: bc,
+				lastSeen:    time.Now(),
+			}
+			backendMap[clientKey] = entry
+			go func(client *net.UDPAddr, backendConn *net.UDPConn, key string) {
+				bBuf := make([]byte, 2048)
+				for {
+					backendConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+					n2, _, err2 := backendConn.ReadFromUDP(bBuf)
+					if err2 != nil {
+						log.Printf("[UDP] Closing connection for %s: %v", key, err2)
+						backendConn.Close()
+						mu.Lock()
+						delete(backendMap, key)
+						mu.Unlock()
+						return
+					}
+					conn.WriteToUDP(bBuf[:n2], client)
+				}
+			}(clientAddr, bc, clientKey)
+		}
+		entry.lastSeen = time.Now()
+		_, _ = entry.backendConn.Write(buf[:n])
+		mu.Unlock()
+	}
 }
 
-// ------------------- main -------------------
+// ------------------------
+// Main function
+// ------------------------
 
 func main() {
-    targetIP := flag.String("targetIP", "", "Backend server IP address")
-    targetPort := flag.String("targetPort", "", "Backend server port")
-    listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
-    flag.Parse()
+	// Parse command-line flags.
+	targetIP := flag.String("targetIP", "", "Backend server IP address")
+	targetPort := flag.String("targetPort", "", "Backend server port")
+	listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
+	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL for DDOS alerts (optional)")
+	flag.Parse()
 
-    if *targetIP == "" || *targetPort == "" || *listenPort == "" {
-        fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port>\n", os.Args[0])
-        os.Exit(1)
-    }
+	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
+		fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port> [-discordWebhook=<url>]\n", os.Args[0])
+		os.Exit(1)
+	}
 
-    // Start both TCP and UDP proxies on the same port.
-    go startTCPProxy(*listenPort, *targetIP, *targetPort)
-    startUDPProxy(*listenPort, *targetIP, *targetPort)
+	// Start attack monitoring in the background.
+	go monitorAttack(*discordWebhook)
+
+	// Start both TCP and UDP proxies on the same port.
+	go startTCPProxy(*listenPort, *targetIP, *targetPort)
+	startUDPProxy(*listenPort, *targetIP, *targetPort)
 }
