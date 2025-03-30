@@ -143,7 +143,6 @@ var (
 // ------------------------
 
 func isLegitHandshake(data []byte) bool {
-	// (This function is kept for TCP; for UDP we now whitelist directly.)
 	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 &&
 		(data[2] >= 0x00 && data[2] <= 0x03) {
 		return true
@@ -245,7 +244,7 @@ type sessionData struct {
 }
 
 var (
-	// Keep legitimate sessions active for up to 600 seconds.
+	// Set sessionTTL to 600 seconds (10 minutes) to keep legitimate sessions active.
 	sessionMap   = make(map[string]*sessionData)
 	sessionMu    sync.Mutex
 	cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions
@@ -295,10 +294,16 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// Instead of a handshake check, whitelist any new client.
+		// For new sessions, require a valid handshake.
+		if !isWhitelisted(clientIP) && !isLegitHandshake(buf[:n]) {
+			log.Printf(">> [UDP] Dropped packet from %s - invalid handshake", clientIP)
+			banIP(clientIP)
+			continue
+		}
+		// If not whitelisted, update whitelist.
 		if !isWhitelisted(clientIP) {
 			updateWhitelist(clientIP)
-			log.Printf(">> [UDP] [%s] Whitelisted", clientIP)
+			log.Printf(">> [UDP] [%s] Whitelisted via UDP handshake", clientIP)
 		}
 
 		// Update or create persistent session.
@@ -397,7 +402,7 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 	var peakMbps float64
 	var belowCount int
 
-	// Set thresholds for attack detection.
+	// Set thresholds (adjust these as needed).
 	const ppsThreshold = 1000 // packets per second threshold
 	const mbpsThreshold = 1.0 // Mbps threshold
 
@@ -490,7 +495,7 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy in a goroutine.
+	// Start UDP proxy (runs in main goroutine).
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
 	// Start DDoS monitoring.
