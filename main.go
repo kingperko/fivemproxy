@@ -271,13 +271,17 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			continue
 		}
 
-		// Attempt to read response from backend.
+		// Attempt to read response from backend with an increased timeout.
 		respBuf := make([]byte, 2048)
-		backendConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		backendConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n2, err := backendConn.Read(respBuf)
 		backendConn.Close()
 		if err != nil {
-			log.Printf(">> [UDP] Read from backend error: %v", err)
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				log.Printf(">> [UDP] Read from backend timeout, no response received")
+			} else {
+				log.Printf(">> [UDP] Read from backend error: %v", err)
+			}
 			continue
 		}
 
