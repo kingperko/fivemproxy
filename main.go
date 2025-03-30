@@ -106,17 +106,24 @@ func banIP(ip string) {
 	bannedIPsMu.Unlock()
 }
 
+// isBanned checks if an IP is banned.
+func isBanned(ip string) bool {
+	bannedIPsMu.RLock()
+	defer bannedIPsMu.RUnlock()
+	return bannedIPs[ip]
+}
+
 // ------------------------
 // Handshake Detection
 // ------------------------
 
-// isLegitHandshake now accepts raw bytes and returns true if the data indicates a
-// TLS handshake (common for FiveM) or contains known plaintext keywords.
+// isLegitHandshake returns true if the data is recognized as TLS or known plaintext.
 func isLegitHandshake(data []byte) bool {
 	// Check for TLS handshake: record type 0x16 with version 0x03 and version byte 0x00-0x03.
 	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x00 && data[2] <= 0x03) {
 		return true
 	}
+	// Check for known plaintext keywords (info.json, players.json, etc.).
 	lower := strings.ToLower(string(data))
 	if strings.Contains(lower, "get /info.json") ||
 		strings.Contains(lower, "get /players.json") ||
@@ -135,13 +142,10 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 
 	// Immediately drop if IP is banned.
-	bannedIPsMu.RLock()
-	if bannedIPs[clientIP] {
-		bannedIPsMu.RUnlock()
+	if isBanned(clientIP) {
 		log.Printf(">> [TCP] Dropped connection from banned IP %s", clientIP)
 		return
 	}
-	bannedIPsMu.RUnlock()
 
 	// If already whitelisted, just proxy.
 	if isWhitelisted(clientIP) {
@@ -152,7 +156,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 
 	// Set a short deadline to read the initial handshake.
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buf := make([]byte, 1024)
+	buf := make([]byte, 2048)
 	n, err := conn.Read(buf)
 	conn.SetReadDeadline(time.Time{})
 	if err != nil || n == 0 {
@@ -174,6 +178,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	updateWhitelist(clientIP)
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf(">> [TCP] [%s] Authenticated and whitelisted", clientIP)
+
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientIP, err)
@@ -181,7 +186,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	defer backendConn.Close()
 
-	// Forward the handshake to the backend.
+	// Forward the initial handshake data to the backend.
 	backendConn.Write(buf[:n])
 	proxyTCPWithConn(conn, backendConn, clientIP)
 }
@@ -216,6 +221,12 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 // UDP Proxy Logic
 // ------------------------
 
+// We keep a map of client addresses -> persistent backend connections.
+type udpMapping struct {
+	backendConn *net.UDPConn
+	lastSeen    time.Time
+}
+
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
@@ -228,10 +239,24 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	defer conn.Close()
 	log.Printf(">> [UDP] Listening on port %s", listenPort)
 
-	backendAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
-	if err != nil {
-		log.Fatalf(">> [UDP] Error resolving backend address: %v", err)
-	}
+	var mu sync.Mutex
+	backendMap := make(map[string]*udpMapping) // key: clientAddr.String()
+
+	// Goroutine to periodically clean up old mappings.
+	go func() {
+		for {
+			time.Sleep(60 * time.Second)
+			mu.Lock()
+			for key, mapping := range backendMap {
+				if time.Since(mapping.lastSeen) > 5*time.Minute {
+					log.Printf(">> [UDP] Closing stale connection for %s", key)
+					mapping.backendConn.Close()
+					delete(backendMap, key)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
 
 	buf := make([]byte, 2048)
 	for {
@@ -243,62 +268,80 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		clientIP := clientAddr.IP.String()
 
 		// Drop packet if IP is banned.
-		bannedIPsMu.RLock()
-		if bannedIPs[clientIP] {
-			bannedIPsMu.RUnlock()
+		if isBanned(clientIP) {
 			log.Printf(">> [UDP] Dropped packet from banned IP %s", clientIP)
 			continue
 		}
-		bannedIPsMu.RUnlock()
 
-		// Validate handshake.
-		if !isWhitelisted(clientIP) && !isLegitHandshake(buf[:n]) {
-			log.Printf(">> [UDP] Dropped packet from %s - invalid handshake", clientIP)
-			banIP(clientIP)
-			sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious UDP packet detected. Connection dropped.", 0xff0000)
-			continue
-		}
+		// If not whitelisted, check handshake. If invalid, ban.
 		if !isWhitelisted(clientIP) {
+			if !isLegitHandshake(buf[:n]) {
+				log.Printf(">> [UDP] Dropped packet from %s - invalid handshake", clientIP)
+				banIP(clientIP)
+				sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious UDP packet detected. Connection dropped.", 0xff0000)
+				continue
+			}
 			updateWhitelist(clientIP)
 			log.Printf(">> [UDP] [%s] Whitelisted via UDP handshake", clientIP)
 		}
 
-		// Forward packet to backend.
-		backendConn, err := net.DialUDP("udp", nil, backendAddr)
-		if err != nil {
-			log.Printf(">> [UDP] Backend dial error: %v", err)
-			continue
+		// Now forward to backend, but first we need a persistent backendConn for this client.
+		clientKey := clientAddr.String()
+		mu.Lock()
+		mapping, found := backendMap[clientKey]
+		if !found {
+			// Create a new backend connection for this client.
+			backendAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
+			if err != nil {
+				mu.Unlock()
+				log.Printf(">> [UDP] Error resolving backend address: %v", err)
+				continue
+			}
+			bc, err := net.DialUDP("udp", nil, backendAddr)
+			if err != nil {
+				mu.Unlock()
+				log.Printf(">> [UDP] Error dialing backend for %s: %v", clientKey, err)
+				continue
+			}
+
+			mapping = &udpMapping{
+				backendConn: bc,
+				lastSeen:    time.Now(),
+			}
+			backendMap[clientKey] = mapping
+
+			// Start a reader goroutine for the backend -> client traffic.
+			go func(cKey string, cAddr *net.UDPAddr, bc *net.UDPConn) {
+				respBuf := make([]byte, 2048)
+				for {
+					bc.SetReadDeadline(time.Now().Add(5 * time.Minute))
+					n2, _, err2 := bc.ReadFromUDP(respBuf)
+					if err2 != nil {
+						// Any error closes this mapping
+						log.Printf(">> [UDP] Closing connection for %s: %v", cKey, err2)
+						bc.Close()
+						mu.Lock()
+						delete(backendMap, cKey)
+						mu.Unlock()
+						return
+					}
+					// Forward the data back to the client
+					conn.WriteToUDP(respBuf[:n2], cAddr)
+				}
+			}(clientKey, clientAddr, bc)
 		}
-		_, err = backendConn.Write(buf[:n])
+		// Update lastSeen
+		mapping.lastSeen = time.Now()
+		bc := mapping.backendConn
+		mu.Unlock()
+
+		// Send the client packet to the backend.
+		_, err = bc.Write(buf[:n])
 		if err != nil {
 			log.Printf(">> [UDP] Write to backend error: %v", err)
-			backendConn.Close()
 			continue
 		}
-		respBuf := make([]byte, 2048)
-		backendConn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n2, err := backendConn.Read(respBuf)
-		backendConn.Close()
-		if err != nil {
-			log.Printf(">> [UDP] Read from backend error: %v", err)
-			continue
-		}
-		_, err = conn.WriteToUDP(respBuf[:n2], clientAddr)
-		if err != nil {
-			log.Printf(">> [UDP] Write to client error: %v", err)
-		}
 	}
-}
-
-// ------------------------
-// Utility Functions
-// ------------------------
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ------------------------
