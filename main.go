@@ -20,17 +20,20 @@ import (
 // Discord Notification Support
 // ------------------------
 
+// discordEmbed defines the structure of a Discord embed.
 type discordEmbed struct {
 	Title       string `json:"title,omitempty"`
 	Description string `json:"description,omitempty"`
 	Color       int    `json:"color,omitempty"`
 }
 
+// discordWebhookBody defines the structure of the webhook payload.
 type discordWebhookBody struct {
 	Username string         `json:"username,omitempty"`
 	Embeds   []discordEmbed `json:"embeds"`
 }
 
+// sendDiscordEmbed sends a Discord embed message to the given webhook URL.
 func sendDiscordEmbed(webhookURL, title, description string, color int) {
 	if webhookURL == "" {
 		return
@@ -65,6 +68,33 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		log.Printf(">> [DISCORD] Unexpected status code: %d", resp.StatusCode)
 	}
+}
+
+// sendDDoSAttackStarted sends an embed alert when a DDoS attack is detected.
+func sendDDoSAttackStarted(webhookURL, serverName, serverIP, currentMetrics, attackMethod, targetPort string) {
+	title := "Perko's Proxy"
+	description := ":rotating_light: DDoS Attack Started\n" +
+		"A potential DDoS attack has been detected.\n\n" +
+		"**Server**\n" + serverName + " - " + serverIP + "\n" +
+		"**Current Metrics**\n" + currentMetrics + "\n" +
+		"**Attack Method**\n" + attackMethod + "\n" +
+		"**Target Port**\n" + targetPort
+	// Red color (0xff0000) for attack started.
+	sendDiscordEmbed(webhookURL, title, description, 0xff0000)
+}
+
+// sendDDoSAttackEnded sends an embed alert when a DDoS attack ends.
+func sendDDoSAttackEnded(webhookURL, serverName, serverIP, peakMetrics, firewallStats, attackMethod, targetPort string) {
+	title := "Perko's Proxy"
+	description := ":white_check_mark: DDoS Attack Ended\n" +
+		"The attack has ended. Final recorded metrics:\n\n" +
+		"**Server**\n" + serverName + " - " + serverIP + "\n" +
+		"**Peak Metrics**\n" + peakMetrics + "\n" +
+		"**Firewall Stats**\n" + firewallStats + "\n" +
+		"**Attack Method**\n" + attackMethod + "\n" +
+		"**Target Port**\n" + targetPort
+	// Green color (0x00ff00) for attack ended.
+	sendDiscordEmbed(webhookURL, title, description, 0x00ff00)
 }
 
 // ------------------------
@@ -146,14 +176,12 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	if err != nil || n == 0 {
 		log.Printf(">> [TCP] [%s] Error reading handshake: %v", clientIP, err)
 		banIP(clientIP)
-		sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious TCP handshake detected. Connection dropped.", 0xff0000)
 		return
 	}
 
 	if !isLegitHandshake(buf[:n]) {
 		log.Printf(">> [TCP] [%s] Dropped - Invalid handshake", clientIP)
 		banIP(clientIP)
-		sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious TCP handshake detected. Connection dropped.", 0xff0000)
 		return
 	}
 
@@ -199,18 +227,19 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 // UDP Proxy Logic (Persistent Sessions)
 // ------------------------
 
+// sessionData holds the information for a persistent UDP session.
 type sessionData struct {
 	clientAddr  *net.UDPAddr // Client address
 	backendConn *net.UDPConn // Persistent connection to backend for this client
 	lastActive  time.Time    // Last time this session was used
-	closeOnce   sync.Once    // Ensures cleanup happens only once
+	closeOnce   sync.Once    // Ensures cleanup is done only once
 }
 
 var (
-	// Increased sessionTTL to 600 seconds (10 minutes) to reduce premature cleanup.
+	// Increased sessionTTL to 600 seconds (10 minutes) to prevent premature cleanup.
 	sessionMap   = make(map[string]*sessionData)
 	sessionMu    sync.Mutex
-	cleanupTimer = 30 * time.Second  // Frequency for idle check
+	cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions
 	sessionTTL   = 600 * time.Second // Idle timeout duration (10 minutes)
 )
 
@@ -256,11 +285,13 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious UDP packet detected. Connection dropped.", 0xff0000)
 			continue
 		}
+		// If not whitelisted, update whitelist.
 		if !isWhitelisted(clientIP) {
 			updateWhitelist(clientIP)
 			log.Printf(">> [UDP] [%s] Whitelisted via UDP handshake", clientIP)
 		}
 
+		// Update or create session.
 		sessionMu.Lock()
 		sd, exists := sessionMap[clientAddr.String()]
 		if !exists {
@@ -278,10 +309,12 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			sessionMap[clientAddr.String()] = sd
 			go handleUDPSession(listenConn, sd)
 		} else {
+			// Update lastActive on each packet from an existing session.
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
 
+		// Forward the packet to the backend.
 		_, err = sd.backendConn.Write(buf[:n])
 		if err != nil {
 			log.Printf(">> [UDP] Write to backend error for client %s: %v", clientIP, err)
@@ -297,13 +330,13 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 		n, err := sd.backendConn.Read(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				// Continue waiting for data.
+				// If a timeout occurs, continue to wait for backend responses.
 				continue
 			}
 			log.Printf(">> [UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
 			break
 		}
-		// Update session lastActive on every response.
+		// Update lastActive on receiving any backend data.
 		sessionMu.Lock()
 		sd.lastActive = time.Now()
 		sessionMu.Unlock()
