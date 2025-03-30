@@ -239,17 +239,42 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
 }
 
+// Updated function: Waits for both directions to finish and uses CloseWrite for graceful shutdown.
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	
+	// Copy from client to backend.
 	go func() {
-		io.Copy(backend, client)
-		done <- struct{}{}
+		defer wg.Done()
+		_, err := io.Copy(backend, client)
+		if err != nil {
+			log.Printf(">> [TCP] Error copying from client to backend: %v", err)
+		}
+		// Gracefully close the write side of the backend connection.
+		if tcpConn, ok := backend.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		} else {
+			backend.Close()
+		}
 	}()
+	
+	// Copy from backend to client.
 	go func() {
-		io.Copy(client, backend)
-		done <- struct{}{}
+		defer wg.Done()
+		_, err := io.Copy(client, backend)
+		if err != nil {
+			log.Printf(">> [TCP] Error copying from backend to client: %v", err)
+		}
+		// Gracefully close the write side of the client connection.
+		if tcpConn, ok := client.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		} else {
+			client.Close()
+		}
 	}()
-	<-done
+	
+	wg.Wait()
 	log.Printf(">> [TCP] [%s] Connection closed", clientIP)
 }
 
