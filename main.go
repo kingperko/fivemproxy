@@ -2,17 +2,15 @@
 // For example, if installing Go via snap:
 //     sudo snap install go --classic
 // Then run your program with:
-//     go run proxy_http_heuristic.go -targetIP=<BACKEND_IP> -targetPort=<BACKEND_PORT> -listenPort=<PROXY_PORT> -discordWebhook=<WEBHOOK_URL>
+//     go run main.go -targetIP=<BACKEND_IP> -targetPort=<BACKEND_PORT> -listenPort=<PROXY_PORT> [-discordWebhook=<WEBHOOK_URL>]
 
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -117,10 +115,10 @@ const (
 // IPInfo holds per-IP data.
 type IPInfo struct {
 	State         IPState
-	ConnCount     int       // active TCP connection count
+	ConnCount     int       // active TCP connections count
 	FirstSeen     time.Time // when first seen
-	NewConnBurst  int       // count of new connections in a short window
-	LastBurstTime time.Time // last time a burst count was started
+	NewConnBurst  int       // count of new connections in a burst
+	LastBurstTime time.Time // when the burst counter was last reset
 }
 
 type IPStore struct {
@@ -160,7 +158,7 @@ func (s *IPStore) setState(ip string, state IPState) {
 
 var ipStore = newIPStore()
 
-// Ban an IP, mark it blocked, and send a Discord alert.
+// Ban an IP: mark it as Blocked and send a Discord alert.
 func banIP(ip, reason, discordWebhook string) {
 	ipStore.setState(ip, Blocked)
 	logWarn(fmt.Sprintf("BANNED: IP %s blocked. Reason: %s", ip, reason))
@@ -171,10 +169,9 @@ func banIP(ip, reason, discordWebhook string) {
 // Heuristic HTTP Request Check
 // ----------------------------------------------------------------------
 
-// isValidHTTPHeader checks if the header bytes appear to be a valid HTTP request.
+// isValidHTTPHeader checks if the initial data appears to be a valid HTTP request.
 func isValidHTTPHeader(data []byte) bool {
 	header := string(data)
-	// Check that it begins with a common HTTP method
 	validMethods := []string{"GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS "}
 	methodValid := false
 	for _, m := range validMethods {
@@ -186,14 +183,10 @@ func isValidHTTPHeader(data []byte) bool {
 	if !methodValid {
 		return false
 	}
-	// Check for required headers
-	if !strings.Contains(header, "Host:") {
+	// Check for key headers.
+	if !strings.Contains(header, "Host:") || !strings.Contains(header, "User-Agent:") {
 		return false
 	}
-	if !strings.Contains(header, "User-Agent:") {
-		return false
-	}
-	// Optionally, check for HTTP version indication.
 	if !(strings.Contains(header, "HTTP/1.1") || strings.Contains(header, "HTTP/1.0")) {
 		return false
 	}
@@ -204,24 +197,21 @@ func isValidHTTPHeader(data []byte) bool {
 // TCP Proxy with HTTP Heuristics
 // ----------------------------------------------------------------------
 
-// readTimeout is the maximum time to wait for initial data.
 const readTimeout = 3 * time.Second
 
-// Thresholds for connection bursts and concurrent connections.
+// Thresholds for rate limiting.
 const (
-	maxNewConnBurst    = 10 // if an unknown IP makes >10 new connections in 5 seconds, block it
-	burstWindow        = 5 * time.Second
-	maxConcurrentConns = 5  // if an IP has more than 5 concurrent connections, block it
+	maxNewConnBurst    = 10              // max new connections from an unknown IP in burstWindow
+	burstWindow        = 5 * time.Second // burst window duration
+	maxConcurrentConns = 5               // max concurrent connections per IP
 )
 
-// handleTCPConnection reads initial data from the client and checks if it looks like a valid HTTP request.
 func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook string) {
 	defer client.Close()
 	clientAddr := client.RemoteAddr().String()
 	ip := strings.Split(clientAddr, ":")[0]
 	info := ipStore.getOrCreate(ip)
 
-	// If already blocked, drop immediately.
 	if info.State == Blocked {
 		logWarn(fmt.Sprintf("[TCP] Dropping connection from blocked IP %s", ip))
 		return
@@ -247,18 +237,17 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook s
 	info.ConnCount++
 	currentConns := info.ConnCount
 	ipStore.Unlock()
-	if currentConns > maxConcurrentConns {
-		banIP(ip, fmt.Sprintf("Too many concurrent connections (%d)", currentConns), discordWebhook)
-		return
-	}
-	// Decrement connection count when done.
 	defer func() {
 		ipStore.Lock()
 		info.ConnCount--
 		ipStore.Unlock()
 	}()
+	if currentConns > maxConcurrentConns {
+		banIP(ip, fmt.Sprintf("Too many concurrent connections (%d)", currentConns), discordWebhook)
+		return
+	}
 
-	// Read initial data for a handshake check.
+	// Read initial data from the client.
 	client.SetReadDeadline(time.Now().Add(readTimeout))
 	buf := make([]byte, 512)
 	n, err := client.Read(buf)
@@ -276,15 +265,13 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook s
 		banIP(ip, "Invalid HTTP request header", discordWebhook)
 		return
 	}
-	// If it passes our heuristic, mark IP as whitelisted.
+
+	// Passed the heuristic check: mark as whitelisted.
 	ipStore.setState(ip, Whitelisted)
 	logInfo(fmt.Sprintf("[TCP] Whitelisted IP %s after valid HTTP handshake", ip))
-
-	// Forward the connection including the already-read initial data.
 	forwardTCPWithInitial(client, targetIP, targetPort, initialData)
 }
 
-// forwardTCPWithInitial proxies data from client to backend, first sending initial data.
 func forwardTCPWithInitial(client net.Conn, targetIP, targetPort string, initial []byte) {
 	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -307,7 +294,6 @@ func forwardTCPWithInitial(client net.Conn, targetIP, targetPort string, initial
 	<-done
 }
 
-// forwardTCP simply proxies data without extra steps.
 func forwardTCP(client net.Conn, targetIP, targetPort string) {
 	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -367,13 +353,11 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 	defer conn.Close()
 	logInfo(fmt.Sprintf("[UDP] Proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort))
-
 	targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		logError(fmt.Sprintf("[UDP] Could not resolve backend %s:%s: %v", targetIP, targetPort, err))
 		os.Exit(1)
 	}
-
 	backendMap := make(map[string]*udpEntry)
 	var mu sync.Mutex
 	buf := make([]byte, 2048)
@@ -400,7 +384,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			}
 			entry = &udpEntry{backendConn: bc, lastSeen: time.Now()}
 			backendMap[clientAddr.String()] = entry
-
 			go func(ca *net.UDPAddr, bc *net.UDPConn, key string) {
 				backendBuf := make([]byte, 2048)
 				for {
