@@ -1,5 +1,3 @@
-package main
-
 import (
 	"bytes"
 	"encoding/json"
@@ -22,15 +20,15 @@ import (
 
 // discordEmbed defines the structure of a Discord embed.
 type discordEmbed struct {
-	Title       string `json:"title,omitempty"`
-	Description string `json:"description,omitempty"`
-	Color       int    `json:"color,omitempty"`
+	Title       string json:"title,omitempty"
+	Description string json:"description,omitempty"
+	Color       int    json:"color,omitempty"
 }
 
 // discordWebhookBody defines the structure of the webhook payload.
 type discordWebhookBody struct {
-	Username string         `json:"username,omitempty"`
-	Embeds   []discordEmbed `json:"embeds"`
+	Username string         json:"username,omitempty"
+	Embeds   []discordEmbed json:"embeds"
 }
 
 // sendDiscordEmbed sends a Discord embed message to the given webhook URL.
@@ -503,4 +501,5 @@ func main() {
 
 	// Block forever.
 	select {}
-}
+}  
+ 
