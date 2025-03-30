@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -12,7 +13,7 @@ import (
     "time"
 )
 
-// Simple IP allow/block
+// Simple IP allow/block management.
 var whitelistedIPs = make(map[string]bool)
 var whitelistedMu sync.RWMutex
 
@@ -29,7 +30,7 @@ func whitelistIP(ip string) {
     log.Printf("[WHITELIST] %s", ip)
 }
 
-// Example check for a "FiveM handshake"
+// Example check for a "FiveM handshake" in the initial data.
 func isLikelyFiveMHandshake(data string) bool {
     data = strings.ToLower(data)
     return strings.Contains(data, "fivem") ||
@@ -44,55 +45,46 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
     clientAddr := client.RemoteAddr().String()
     clientIP := strings.Split(clientAddr, ":")[0]
 
-    // If not whitelisted, check the first packet for a legit handshake.
+    // If not whitelisted, perform a handshake check.
     if !isWhitelisted(clientIP) {
-        // Make a buffer to read the first data from the client.
         buf := make([]byte, 2048)
-
-        // Try to read within 3 seconds (avoid hanging on junk).
-        _ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+        client.SetReadDeadline(time.Now().Add(3 * time.Second))
         n, err := client.Read(buf)
-        _ = client.SetReadDeadline(time.Time{})
-
+        client.SetReadDeadline(time.Time{})
         if err != nil && err != io.EOF {
             log.Printf("[TCP] Error reading handshake from %s: %v", clientAddr, err)
             return
         }
-        // If we actually read something, check if it's a valid handshake:
         if n > 0 {
             data := string(buf[:n])
             if !isLikelyFiveMHandshake(data) {
                 log.Printf("[TCP] Dropping unrecognized handshake from %s", clientAddr)
                 return
             }
-            // Valid => whitelist
+            // Valid handshake: whitelist IP.
             whitelistIP(clientIP)
             log.Printf("[TCP] Valid handshake from %s", clientAddr)
+
+           	// Connect to backend and forward the handshake data.
+            backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
+            if err != nil {
+                log.Printf("[TCP] Backend dial error: %v", err)
+                return
+            }
+            defer backend.Close()
+
+            _, _ = backend.Write(buf[:n])
+            go io.Copy(backend, client)
+           	io.Copy(client, backend)
+            return
         }
-        // If n == 0, we read nothing; that’s also suspicious, so we can drop.
         if n == 0 {
             log.Printf("[TCP] Empty handshake from %s, dropping.", clientAddr)
             return
         }
-
-        // Now connect to the backend and forward that first packet.
-        backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
-        if err != nil {
-            log.Printf("[TCP] Backend dial error: %v", err)
-            return
-        }
-        defer backend.Close()
-
-        // Forward the handshake data we just read:
-        _, _ = backend.Write(buf[:n])
-
-        // Start piping the rest of the traffic in goroutines:
-        go io.Copy(backend, client)
-        io.Copy(client, backend)
-        return
     }
 
-    // If IP is already whitelisted, just do a normal TCP proxy (no handshake check).
+    // If already whitelisted, just forward traffic.
     backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
     if err != nil {
         log.Printf("[TCP] Backend dial error: %v", err)
@@ -122,7 +114,7 @@ func startTCPProxy(listenPort, targetIP, targetPort string) {
     }
 }
 
-// Minimal main
+// Minimal main function.
 func main() {
     targetIP := flag.String("targetIP", "", "Backend IP")
     targetPort := flag.String("targetPort", "", "Backend Port")
@@ -135,6 +127,7 @@ func main() {
     }
 
     go startTCPProxy(*listenPort, *targetIP, *targetPort)
-    // If you also have a UDP proxy, start it here in a similar manner.
-    select {} // block forever
+
+    // Block forever (or add UDP proxy here if needed)
+    select {}
 }
