@@ -514,7 +514,7 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy in a separate goroutine.
+	// Start UDP proxy in a sepaate goroutine.
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
 	// Start DDoS monitoring in its own goroutine.
