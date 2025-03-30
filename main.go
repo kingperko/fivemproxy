@@ -328,3 +328,15 @@ func main() {
 	// Start UDP proxy (runs in main goroutine).
 	startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 }
+
+// ------------------------
+// Helper Function
+// ------------------------
+
+// min returns the smaller of two integers.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
