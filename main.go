@@ -251,7 +251,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 }
 
 // ------------------------
-// UDP Proxy Logic (Persistent Sessions with Handshake Check)
+// UDP Proxy Logic (Persistent Sessions with Modified Handshake Check)
 // ------------------------
 
 type sessionData struct {
@@ -328,23 +328,13 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// If IP is not whitelisted and we haven't performed a handshake check, do it now.
+		// Modified handshake check:
+		// Instead of banning when the handshake does not match,
+		// we simply whitelist the IP and mark handshake as checked.
 		if !isWhitelisted(clientIP) && !hasCheckedHandshake(clientIP) {
-			if !isFiveMHandshake(buf[:n]) {
-				// Fails handshake => ban
-				log.Printf(">> [UDP] [%s] Dropped - invalid handshake, banning IP", clientIP)
-				banIP(clientIP)
-				continue
-			}
-			// Passes handshake => whitelist
-			log.Printf(">> [UDP] [%s] Authenticated handshake => whitelisted", clientIP)
+			log.Printf(">> [UDP] [%s] No handshake check performed, whitelisting", clientIP)
 			updateWhitelist(clientIP)
 			markHandshakeChecked(clientIP)
-		} else if !isWhitelisted(clientIP) {
-			// If we've already checked handshake but not whitelisted, ban (unlikely case)
-			log.Printf(">> [UDP] [%s] No handshake pass => ban", clientIP)
-			banIP(clientIP)
-			continue
 		}
 
 		// Normal flow: IP is whitelisted.
