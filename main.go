@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,7 +31,6 @@ type discordWebhookBody struct {
 	Embeds   []discordEmbed `json:"embeds"`
 }
 
-// sendDiscordEmbed sends a brief, formatted message to Discord.
 func sendDiscordEmbed(webhookURL, title, description string, color int) {
 	if webhookURL == "" {
 		return
@@ -74,33 +72,27 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 // ------------------------
 
 var (
-	// Whitelisted IPs are allowed to pass without further checks.
 	whitelistedIPs   = make(map[string]bool)
 	whitelistedIPsMu sync.RWMutex
 
-	// Banned IPs (suspicious connections) are blocked immediately.
 	bannedIPs   = make(map[string]bool)
 	bannedIPsMu sync.RWMutex
 
-	// A simple TCP connection counter (for reference/logging).
 	tcpConnCount int64
 )
 
-// updateWhitelist adds an IP to the whitelist.
 func updateWhitelist(ip string) {
 	whitelistedIPsMu.Lock()
 	whitelistedIPs[ip] = true
 	whitelistedIPsMu.Unlock()
 }
 
-// isWhitelisted returns true if the IP is already whitelisted.
 func isWhitelisted(ip string) bool {
 	whitelistedIPsMu.RLock()
 	defer whitelistedIPsMu.RUnlock()
 	return whitelistedIPs[ip]
 }
 
-// banIP adds an IP to the banned list.
 func banIP(ip string) {
 	bannedIPsMu.Lock()
 	bannedIPs[ip] = true
@@ -111,10 +103,7 @@ func banIP(ip string) {
 // Handshake Detection
 // ------------------------
 
-// isLegitHandshake returns true if the data indicates a
-// TLS handshake (common for FiveM) or known plaintext keywords.
 func isLegitHandshake(data []byte) bool {
-	// Check for TLS handshake: record type 0x16 with version 0x03 and version byte 0x00-0x03.
 	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x00 && data[2] <= 0x03) {
 		return true
 	}
@@ -128,19 +117,13 @@ func isLegitHandshake(data []byte) bool {
 }
 
 // ------------------------
-// TCP Proxy Logic (optional)
+// TCP Proxy Logic
 // ------------------------
-
-// If you don't need TCP, you can remove or disable this section.
-var proxyProtocol = true
 
 func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook string) {
 	defer conn.Close()
-	clientAddr := conn.RemoteAddr().(*net.TCPAddr)
-	clientIP := clientAddr.IP.String()
-	// Removed unused variable: clientPort
+	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 
-	// Immediately drop if IP is banned.
 	bannedIPsMu.RLock()
 	if bannedIPs[clientIP] {
 		bannedIPsMu.RUnlock()
@@ -149,14 +132,12 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	bannedIPsMu.RUnlock()
 
-	// If already whitelisted, just proxy.
 	if isWhitelisted(clientIP) {
 		log.Printf(">> [TCP] [%s] Whitelisted - connection allowed", clientIP)
-		proxyTCP(conn, targetIP, targetPort, clientAddr)
+		proxyTCP(conn, targetIP, targetPort)
 		return
 	}
 
-	// Set a short deadline to read the initial handshake.
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
@@ -168,7 +149,6 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Check handshake validity.
 	if !isLegitHandshake(buf[:n]) {
 		log.Printf(">> [TCP] [%s] Dropped - Invalid handshake", clientIP)
 		banIP(clientIP)
@@ -176,43 +156,28 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Valid handshake: whitelist and proxy.
 	updateWhitelist(clientIP)
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf(">> [TCP] [%s] Authenticated and whitelisted", clientIP)
+	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
+	if err != nil {
+		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientIP, err)
+		return
+	}
+	defer backendConn.Close()
 
-	proxyTCPWithHandshake(conn, targetIP, targetPort, clientAddr, buf[:n])
+	backendConn.Write(buf[:n])
+	proxyTCPWithConn(conn, backendConn, clientIP)
 }
 
-func proxyTCP(client net.Conn, targetIP, targetPort string, clientAddr *net.TCPAddr) {
+func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf(">> [TCP] Backend dial error: %v", err)
 		return
 	}
 	defer backendConn.Close()
-
-	if proxyProtocol {
-		sendProxyProtocolHeader(backendConn, clientAddr, targetIP, targetPort)
-	}
-
-	proxyTCPWithConn(client, backendConn, clientAddr.String())
-}
-
-func proxyTCPWithHandshake(client net.Conn, targetIP, targetPort string, clientAddr *net.TCPAddr, initialData []byte) {
-	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
-	if err != nil {
-		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientAddr.IP, err)
-		return
-	}
-	defer backendConn.Close()
-
-	if proxyProtocol {
-		sendProxyProtocolHeader(backendConn, clientAddr, targetIP, targetPort)
-	}
-
-	_, _ = backendConn.Write(initialData)
-	proxyTCPWithConn(client, backendConn, clientAddr.String())
+	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
 }
 
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
@@ -229,31 +194,22 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	log.Printf(">> [TCP] [%s] Connection closed", clientIP)
 }
 
-func sendProxyProtocolHeader(backendConn net.Conn, clientAddr *net.TCPAddr, targetIP, targetPort string) {
-	localPort, _ := strconv.Atoi(targetPort)
-	header := fmt.Sprintf("PROXY TCP4 %s %s %d %d\r\n",
-		clientAddr.IP.String(),
-		targetIP,
-		clientAddr.Port,
-		localPort,
-	)
-	backendConn.Write([]byte(header))
-}
-
 // ------------------------
-// UDP Proxy Logic
+// UDP Proxy Logic (Persistent Sessions)
 // ------------------------
 
 type sessionData struct {
-	clientAddr *net.UDPAddr
-	lastActive time.Time
+	clientAddr  *net.UDPAddr    // Client address
+	backendConn *net.UDPConn    // Persistent connection to backend for this client
+	lastActive  time.Time       // Last time this session was used
+	closeOnce   sync.Once       // To ensure session cleanup happens once
 }
 
 var (
 	sessionMap   = make(map[string]*sessionData)
 	sessionMu    sync.Mutex
-	cleanupTimer = 30 * time.Second  // frequency for cleanup
-	sessionTTL   = 120 * time.Second // session inactivity TTL
+	cleanupTimer = 30 * time.Second  // Cleanup check frequency
+	sessionTTL   = 120 * time.Second // Session idle timeout
 )
 
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
@@ -271,13 +227,8 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	if err != nil {
 		log.Fatalf(">> [UDP] Error resolving backend address: %v", err)
 	}
-	backendConn, err := net.DialUDP("udp", nil, backendAddr)
-	if err != nil {
-		log.Fatalf(">> [UDP] Error dialing backend: %v", err)
-	}
-	log.Printf(">> [UDP] Connected to backend %s:%s", targetIP, targetPort)
 
-	go handleBackendResponses(listenConn, backendConn)
+	// Start cleanup goroutine.
 	go cleanupSessions()
 
 	buf := make([]byte, 2048)
@@ -287,8 +238,9 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			log.Printf(">> [UDP] Read error: %v", err)
 			continue
 		}
-
 		clientIP := clientAddr.IP.String()
+
+		// Drop packet if IP is banned.
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
@@ -297,67 +249,114 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		if !isWhitelisted(clientIP) {
-			log.Printf(">> [UDP] Dropped packet from %s - not whitelisted", clientIP)
+		// Check handshake for new sessions.
+		if !isWhitelisted(clientIP) && !isLegitHandshake(buf[:n]) {
+			log.Printf(">> [UDP] Dropped packet from %s - invalid handshake", clientIP)
+			banIP(clientIP)
+			sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious UDP packet detected. Connection dropped.", 0xff0000)
 			continue
 		}
+		// Whitelist if not already.
+		if !isWhitelisted(clientIP) {
+			updateWhitelist(clientIP)
+			log.Printf(">> [UDP] [%s] Whitelisted via UDP handshake", clientIP)
+		}
 
+		// Get or create a persistent session.
 		sessionMu.Lock()
 		sd, exists := sessionMap[clientAddr.String()]
 		if !exists {
-			sd = &sessionData{clientAddr: clientAddr, lastActive: time.Now()}
+			backendConn, err := net.DialUDP("udp", nil, backendAddr)
+			if err != nil {
+				sessionMu.Unlock()
+				log.Printf(">> [UDP] Error dialing backend for client %s: %v", clientIP, err)
+				continue
+			}
+			sd = &sessionData{
+				clientAddr:  clientAddr,
+				backendConn: backendConn,
+				lastActive:  time.Now(),
+			}
 			sessionMap[clientAddr.String()] = sd
+			go handleUDPSession(listenConn, sd)
 		} else {
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
 
-		_, err = backendConn.Write(buf[:n])
+		// Forward the client's packet to its persistent backend connection.
+		_, err = sd.backendConn.Write(buf[:n])
 		if err != nil {
-			log.Printf(">> [UDP] Write to backend error: %v", err)
+			log.Printf(">> [UDP] Write to backend error for client %s: %v", clientIP, err)
 			continue
 		}
 	}
 }
 
-func handleBackendResponses(listenConn, backendConn *net.UDPConn) {
+// handleUDPSession continuously reads from the backend connection for a given session
+// and forwards responses to the client.
+func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 	buf := make([]byte, 2048)
 	for {
-		backendConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		n, _, err := backendConn.ReadFromUDP(buf)
+		sd.backendConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := sd.backendConn.Read(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				// Continue waiting for data.
 				continue
 			}
-			log.Printf(">> [UDP] Error reading from backend: %v", err)
-			continue
+			log.Printf(">> [UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
+			break
 		}
-
-		sessionMu.Lock()
-		for _, sd := range sessionMap {
-			_, werr := listenConn.WriteToUDP(buf[:n], sd.clientAddr)
-			if werr != nil {
-				log.Printf(">> [UDP] Write to client %s error: %v", sd.clientAddr, werr)
-			}
+		// Forward the response back to the client.
+		_, err = listenConn.WriteToUDP(buf[:n], sd.clientAddr)
+		if err != nil {
+			log.Printf(">> [UDP] Error writing to client %s: %v", sd.clientAddr, err)
 		}
-		sessionMu.Unlock()
 	}
+	// On error or closure, clean up the session.
+	cleanupSession(sd.clientAddr.String())
 }
 
+// cleanupSessions periodically removes sessions that have been idle too long.
 func cleanupSessions() {
 	ticker := time.NewTicker(cleanupTimer)
 	defer ticker.Stop()
-	for {
-		<-ticker.C
+	for range ticker.C {
 		now := time.Now()
 		sessionMu.Lock()
 		for key, sd := range sessionMap {
 			if now.Sub(sd.lastActive) > sessionTTL {
-				delete(sessionMap, key)
+				log.Printf(">> [UDP] Closing idle session for client %s", sd.clientAddr)
+				cleanupSession(key)
 			}
 		}
 		sessionMu.Unlock()
 	}
+}
+
+// cleanupSession closes and removes a session.
+func cleanupSession(key string) {
+	sessionMu.Lock()
+	sd, exists := sessionMap[key]
+	if exists {
+		delete(sessionMap, key)
+		sd.closeOnce.Do(func() {
+			sd.backendConn.Close()
+		})
+	}
+	sessionMu.Unlock()
+}
+
+// ------------------------
+// Utility Functions
+// ------------------------
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ------------------------
@@ -378,7 +377,7 @@ func main() {
 
 	log.Printf(">> [INFO] Starting proxy: forwarding to %s:%s on port %s", *targetIP, *targetPort, *listenPort)
 
-	// Start TCP proxy in a goroutine (if needed)
+	// Start TCP proxy in a goroutine.
 	go func() {
 		ln, err := net.Listen("tcp", ":"+*listenPort)
 		if err != nil {
@@ -396,17 +395,6 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy (runs in main goroutine)
+	// Start UDP proxy (runs in main goroutine).
 	startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
-}
-
-// ------------------------
-// Helper Function
-// ------------------------
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
