@@ -2,12 +2,12 @@
 // For example, if installing Go via snap:
 //     sudo snap install go --classic
 // Then run your program with:
-//     go run aloswall.go -targetIP=<BACKEND_IP> -targetPort=<BACKEND_PORT> -listenPort=<PROXY_PORT> -discordWebhook=<WEBHOOK_URL>
+//     go run proxy_http_heuristic.go -targetIP=<BACKEND_IP> -targetPort=<BACKEND_PORT> -listenPort=<PROXY_PORT> -discordWebhook=<WEBHOOK_URL>
 
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,34 +16,43 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// ------------------------
-// Utility Functions
-// ------------------------
+// ----------------------------------------------------------------------
+// Custom Structured Logging
+// ----------------------------------------------------------------------
 
-// min returns the smaller of two integers.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+type LogLevel string
+
+const (
+	INFO  LogLevel = "INFO"
+	WARN  LogLevel = "WARN"
+	ERROR LogLevel = "ERROR"
+)
+
+func logMsg(level LogLevel, msg string) {
+	now := time.Now().Format("2006-01-02 15:04:05")
+	fmt.Printf("[%s] [%s] %s\n", now, level, msg)
 }
 
-// btom converts bytes to megabytes.
-func btom(bytes int64) float64 {
-	const bytesInMegabyte = 1024 * 1024
-	return float64(bytes) / float64(bytesInMegabyte)
+func logInfo(msg string) {
+	logMsg(INFO, msg)
 }
 
-// ------------------------
-// Discord Embed Support
-// ------------------------
+func logWarn(msg string) {
+	logMsg(WARN, msg)
+}
+
+func logError(msg string) {
+	logMsg(ERROR, msg)
+}
+
+// ----------------------------------------------------------------------
+// Discord Notification (Optional)
+// ----------------------------------------------------------------------
 
 type discordEmbed struct {
 	Title       string `json:"title,omitempty"`
@@ -56,9 +65,9 @@ type discordWebhookBody struct {
 	Embeds   []discordEmbed `json:"embeds"`
 }
 
-func sendDiscordEmbed(webhookURL, title, description string, color int) {
+func sendDiscordNotification(webhookURL, title, description string, color int) {
 	if webhookURL == "" {
-		return // no webhook configured
+		return
 	}
 	embed := discordEmbed{
 		Title:       title,
@@ -66,431 +75,226 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 		Color:       color,
 	}
 	payload := discordWebhookBody{
-		Username: "Smart DDOS Protection - YourBrand",
+		Username: "Lightweight DDOS Protection - YourBrand",
 		Embeds:   []discordEmbed{embed},
 	}
-	jsonData, err := json.Marshal(payload)
+	data, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("[DISCORD] Error marshaling embed JSON: %v", err)
+		logError(fmt.Sprintf("[DISCORD] JSON marshal error: %v", err))
 		return
 	}
-	req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest("POST", webhookURL, strings.NewReader(string(data)))
 	if err != nil {
-		log.Printf("[DISCORD] Error creating Discord request: %v", err)
+		logError(fmt.Sprintf("[DISCORD] Request creation error: %v", err))
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[DISCORD] Error sending to Discord: %v", err)
+		logError(fmt.Sprintf("[DISCORD] Error sending notification: %v", err))
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		log.Printf("[DISCORD] Discord webhook returned status: %d", resp.StatusCode)
+		logError(fmt.Sprintf("[DISCORD] Webhook returned status: %d", resp.StatusCode))
 	}
 }
 
-// ------------------------
-// Global Variables & Constants
-// ------------------------
+// ----------------------------------------------------------------------
+// IP Tracking & Rate Limiting
+// ----------------------------------------------------------------------
 
-// Proxy & DDoS detection globals (for overall interval stats)
-var (
-	tcpConnCount   int64
-	udpPacketCount int64
+// IPState indicates whether an IP is Unknown, Whitelisted, or Blocked.
+type IPState int
 
-	// ipEventCounts collects per-IP event counts (used in overall detection)
-	ipEventCounts   = make(map[string]int64)
-	ipEventCountsMu sync.Mutex
-
-	// bannedIPs: IPs that are banned (by smart protection or overall score)
-	bannedIPs   = make(map[string]bool)
-	bannedIPsMu sync.RWMutex
-
-	// activeTCP tracks IPs with active TCP connections.
-	activeTCP   = make(map[string]bool)
-	activeTCPMu sync.RWMutex
-
-	// For UDP proxy unique IP storage.
-	uniqueIPs sync.Map
-
-	// Overall attack mode flag.
-	attackMode   bool
-	attackModeMu sync.Mutex
-)
-
-// IntervalStats aggregates stats over a fixed interval.
-type IntervalStats struct {
-	TotalTCP  int64
-	TotalUDP  int64
-	IPCounts  map[string]int64
-	StartTime time.Time
-}
-
-const IntervalDuration = 10 * time.Second
-
-// Detection thresholds for overall scoring.
 const (
-	OverallThreshold  int64   = 150
-	BaselineFactor    float64 = 2.0
-	ScoreThreshold    float64 = 50.0
-	DecayFactor       float64 = 0.8
-	RelativeThreshold float64 = 0.8
+	Unknown IPState = iota
+	Whitelisted
+	Blocked
 )
 
-var (
-	ipScores   = make(map[string]float64)
-	ipScoresMu sync.Mutex
-)
-
-func copyMap(src map[string]int64) map[string]int64 {
-	dst := make(map[string]int64)
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
+// IPInfo holds per-IP data.
+type IPInfo struct {
+	State         IPState
+	ConnCount     int       // active TCP connection count
+	FirstSeen     time.Time // when first seen
+	NewConnBurst  int       // count of new connections in a short window
+	LastBurstTime time.Time // last time a burst count was started
 }
 
-func updateIntervalStats() IntervalStats {
-	ipEventCountsMu.Lock()
-	defer ipEventCountsMu.Unlock()
-	return IntervalStats{
-		TotalTCP:  atomic.LoadInt64(&tcpConnCount),
-		TotalUDP:  atomic.LoadInt64(&udpPacketCount),
-		IPCounts:  copyMap(ipEventCounts),
-		StartTime: time.Now(),
+type IPStore struct {
+	sync.Mutex
+	data map[string]*IPInfo
+}
+
+func newIPStore() *IPStore {
+	return &IPStore{
+		data: make(map[string]*IPInfo),
 	}
 }
 
-func resetIntervalStats() {
-	atomic.StoreInt64(&tcpConnCount, 0)
-	atomic.StoreInt64(&udpPacketCount, 0)
-	ipEventCountsMu.Lock()
-	ipEventCounts = make(map[string]int64)
-	ipEventCountsMu.Unlock()
+func (s *IPStore) getOrCreate(ip string) *IPInfo {
+	s.Lock()
+	defer s.Unlock()
+	info, ok := s.data[ip]
+	if !ok {
+		info = &IPInfo{
+			State:     Unknown,
+			FirstSeen: time.Now(),
+		}
+		s.data[ip] = info
+	}
+	return info
 }
 
-// processInterval analyzes overall stats, updates scores, and sends Discord notifications.
-func processInterval(discordWebhook string) {
-	stats := updateIntervalStats()
-	total := stats.TotalTCP + stats.TotalUDP
-	uniqueCount := len(stats.IPCounts)
+func (s *IPStore) setState(ip string, state IPState) {
+	s.Lock()
+	defer s.Unlock()
+	if info, ok := s.data[ip]; ok {
+		info.State = state
+	} else {
+		s.data[ip] = &IPInfo{State: state, FirstSeen: time.Now()}
+	}
+}
 
-	var avg float64
-	if uniqueCount > 0 {
-		avg = float64(total) / float64(uniqueCount)
-	}
+var ipStore = newIPStore()
 
-	ipScoresMu.Lock()
-	for ip, count := range stats.IPCounts {
-		if float64(count) > avg*BaselineFactor {
-			excess := float64(count) - avg*BaselineFactor
-			ipScores[ip] += excess
-		} else {
-			ipScores[ip] *= DecayFactor
-		}
-		activeTCPMu.RLock()
-		_, active := activeTCP[ip]
-		activeTCPMu.RUnlock()
-		if active && ipScores[ip] < ScoreThreshold/2 {
-			ipScores[ip] = 0
-		}
-		if ipScores[ip] > ScoreThreshold {
-			bannedIPsMu.Lock()
-			bannedIPs[ip] = true
-			bannedIPsMu.Unlock()
-			log.Printf("BANNED: IP %s banned with score %.2f", ip, ipScores[ip])
-		}
-	}
-	type ipScore struct {
-		IP    string
-		Score float64
-		Count int64
-	}
-	var offenders []ipScore
-	for ip, count := range stats.IPCounts {
-		score := ipScores[ip]
-		offenders = append(offenders, ipScore{IP: ip, Score: score, Count: count})
-	}
-	sort.Slice(offenders, func(i, j int) bool {
-		return offenders[i].Score > offenders[j].Score
-	})
-	ipScoresMu.Unlock()
+// Ban an IP, mark it blocked, and send a Discord alert.
+func banIP(ip, reason, discordWebhook string) {
+	ipStore.setState(ip, Blocked)
+	logWarn(fmt.Sprintf("BANNED: IP %s blocked. Reason: %s", ip, reason))
+	go sendDiscordNotification(discordWebhook, "IP Banned", fmt.Sprintf("IP: %s\nReason: %s", ip, reason), 0xff0000)
+}
 
-	graphLines := ""
-	maxScore := 1.0
-	if len(offenders) > 0 {
-		maxScore = offenders[0].Score
-	}
-	for i, o := range offenders {
-		if i >= 3 {
+// ----------------------------------------------------------------------
+// Heuristic HTTP Request Check
+// ----------------------------------------------------------------------
+
+// isValidHTTPHeader checks if the header bytes appear to be a valid HTTP request.
+func isValidHTTPHeader(data []byte) bool {
+	header := string(data)
+	// Check that it begins with a common HTTP method
+	validMethods := []string{"GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS "}
+	methodValid := false
+	for _, m := range validMethods {
+		if strings.HasPrefix(header, m) {
+			methodValid = true
 			break
 		}
-		barLen := int((o.Score / maxScore) * 10)
-		if barLen < 1 {
-			barLen = 1
-		}
-		bar := strings.Repeat("█", barLen)
-		graphLines += fmt.Sprintf("%s: %.2f (Count: %d) %s\n", o.IP, o.Score, o.Count, bar)
 	}
-
-	log.Printf("=== Interval Summary ===")
-	log.Printf("TCP: %d | UDP: %d | Total: %d | Unique IPs: %d", stats.TotalTCP, stats.TotalUDP, total, uniqueCount)
-	log.Printf("Top Offenders:\n%s", graphLines)
-
-	attackModeMu.Lock()
-	if uniqueCount > 1 && total > OverallThreshold {
-		if !attackMode {
-			attackMode = true
-			desc := fmt.Sprintf("DDoS attack detected.\nTotal events: %d\nUnique IPs: %d\n\nTop Offenders:\n%s", total, uniqueCount, graphLines)
-			log.Printf(">>> DDoS attack detected. Mitigation enabled.")
-			sendDiscordEmbed(discordWebhook, "Server Mitigation Enabled", desc, 0xff6600)
-		}
-	} else {
-		if attackMode {
-			attackMode = false
-			desc := fmt.Sprintf("DDoS attack ended.\nTotal events: %d\nUnique IPs: %d\n\nTop Offenders:\n%s", total, uniqueCount, graphLines)
-			log.Printf(">>> DDoS attack ended.")
-			sendDiscordEmbed(discordWebhook, "Attack Ended", desc, 0x00bfff)
-		}
+	if !methodValid {
+		return false
 	}
-	attackModeMu.Unlock()
-	resetIntervalStats()
+	// Check for required headers
+	if !strings.Contains(header, "Host:") {
+		return false
+	}
+	if !strings.Contains(header, "User-Agent:") {
+		return false
+	}
+	// Optionally, check for HTTP version indication.
+	if !(strings.Contains(header, "HTTP/1.1") || strings.Contains(header, "HTTP/1.0")) {
+		return false
+	}
+	return true
 }
 
-// ------------------------
-// Advanced Per-IP Smart Protection Store
-// ------------------------
+// ----------------------------------------------------------------------
+// TCP Proxy with HTTP Heuristics
+// ----------------------------------------------------------------------
 
-// Ipin holds per-IP data for smart protection.
-type Ipin struct {
-	PPS         int64
-	Data        int64
-	SYN         int64
-	Mac1        string
-	Mac2        string
-	Mac3        string
-	Blocked     bool
-	Delete      bool
-	Lastblocked time.Time
-	Lastseen    time.Time
-	FirstSeen   time.Time
-	OffenseCount int
-}
+// readTimeout is the maximum time to wait for initial data.
+const readTimeout = 3 * time.Second
 
-// IPData wraps Ipin with a mutex.
-type IPData struct {
-	Data *Ipin
-	Lock sync.Mutex
-}
-
-// IPStore tracks all IPData.
-type IPStore struct {
-	ips map[string]*IPData
-	sync.Mutex
-}
-
-var store = NewIPStore()
-
-func NewIPStore() *IPStore {
-	return &IPStore{
-		ips: make(map[string]*IPData),
-	}
-}
-
-func (s *IPStore) GetOrCreateIPData(ip string) *IPData {
-	s.Lock()
-	defer s.Unlock()
-	ipData, exists := s.ips[ip]
-	if !exists {
-		ipData = &IPData{Data: &Ipin{FirstSeen: time.Now()}}
-		s.ips[ip] = ipData
-	}
-	return ipData
-}
-
-func (s *IPStore) IterateOverIPs(operation func(ip string, data *Ipin)) {
-	s.Lock()
-	defer s.Unlock()
-	for ip, ipData := range s.ips {
-		ipData.Lock.Lock()
-		operation(ip, ipData.Data)
-		if ipData.Data.Delete {
-			delete(s.ips, ip)
-		}
-		ipData.Lock.Unlock()
-	}
-}
-
-// getRegion returns a simple region based on IP (stub).
-func getRegion(ip string) string {
-	if strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "10.") || strings.HasPrefix(ip, "172.16.") {
-		return "Private"
-	}
-	if strings.HasPrefix(ip, "8.") {
-		return "US"
-	}
-	if strings.HasPrefix(ip, "1.") {
-		return "EU"
-	}
-	return "Global"
-}
-
-// Smart protection constants.
+// Thresholds for connection bursts and concurrent connections.
 const (
-	gracePeriod = 10 * time.Second
-	maxOffense  = 2
-	// Thresholds (from pterodactyl config sample)
-	TCPDataThresholdMB = 9
-	UDPDataThresholdMB = 9
-	PPStcpLow          = 3000
-	PPStcpHigh         = 850
-	PPSudpLow          = 4000
-	PPSudpHigh         = 1000
-	AllowedSyn         = 5
+	maxNewConnBurst    = 10 // if an unknown IP makes >10 new connections in 5 seconds, block it
+	burstWindow        = 5 * time.Second
+	maxConcurrentConns = 5  // if an IP has more than 5 concurrent connections, block it
 )
 
-// banIP permanently bans an IP.
-func banIP(ip string) {
-	err := addIPToIPSet("banlist_perm", ip)
-	if err != nil {
-		log.Printf("Failed to add %s to banlist_perm: %v", ip, err)
-	} else {
-		log.Printf("IP %s added to permanent ban list.", ip)
-	}
-	bannedIPsMu.Lock()
-	bannedIPs[ip] = true
-	bannedIPsMu.Unlock()
-}
-
-// Dummy ipset functions (assume ipset is available on system).
-func ensureIPSet(setName string) error {
-	cmd := exec.Command("ipset", "list", setName)
-	err := cmd.Run()
-	if err != nil {
-		fmt.Printf("Ipset '%s' does not exist. Creating it...\n", setName)
-		cmd = exec.Command("ipset", "create", setName, "hash:ip")
-		err = cmd.Run()
-		if err != nil {
-			return fmt.Errorf("failed to create ipset '%s': %w", setName, err)
-		}
-	}
-	return nil
-}
-
-func addIPToIPSet(name, ip string) error {
-	cmd := exec.Command("ipset", "add", name, ip, "-exist")
-	return cmd.Run()
-}
-
-// resetStore periodically resets per-IP counters.
-func resetStore() {
-	for {
-		time.Sleep(5 * time.Second)
-		store.IterateOverIPs(func(ip string, data *Ipin) {
-			if data.Lastseen.Before(time.Now().Add(-90 * time.Second)) {
-				data.Delete = true
-			} else {
-				data.PPS = 0
-				data.Data = 0
-				data.SYN = 0
-				data.Mac1 = ""
-				data.Mac2 = ""
-				data.Mac3 = ""
-			}
-		})
-	}
-}
-
-// ------------------------
-// TCP Proxy Section
-// ------------------------
-
-func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
-	startTime := time.Now()
+// handleTCPConnection reads initial data from the client and checks if it looks like a valid HTTP request.
+func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook string) {
+	defer client.Close()
 	clientAddr := client.RemoteAddr().String()
-	clientIP := strings.Split(clientAddr, ":")[0]
+	ip := strings.Split(clientAddr, ":")[0]
+	info := ipStore.getOrCreate(ip)
 
-	// Check if banned.
-	bannedIPsMu.RLock()
-	if banned, exists := bannedIPs[clientIP]; exists && banned {
-		bannedIPsMu.RUnlock()
-		log.Printf("[TCP] Dropping connection from banned IP %s", clientIP)
-		client.Close()
+	// If already blocked, drop immediately.
+	if info.State == Blocked {
+		logWarn(fmt.Sprintf("[TCP] Dropping connection from blocked IP %s", ip))
 		return
 	}
-	bannedIPsMu.RUnlock()
 
-	// Update active connection and per-IP store.
-	activeTCPMu.Lock()
-	activeTCP[clientIP] = true
-	activeTCPMu.Unlock()
+	// Rate-limit new connections from unknown IPs.
+	now := time.Now()
+	ipStore.Lock()
+	if now.Sub(info.LastBurstTime) > burstWindow {
+		info.NewConnBurst = 0
+		info.LastBurstTime = now
+	}
+	info.NewConnBurst++
+	currentBurst := info.NewConnBurst
+	ipStore.Unlock()
+	if info.State == Unknown && currentBurst > maxNewConnBurst {
+		banIP(ip, "Excessive new connection bursts", discordWebhook)
+		return
+	}
+
+	// Increment concurrent connection count.
+	ipStore.Lock()
+	info.ConnCount++
+	currentConns := info.ConnCount
+	ipStore.Unlock()
+	if currentConns > maxConcurrentConns {
+		banIP(ip, fmt.Sprintf("Too many concurrent connections (%d)", currentConns), discordWebhook)
+		return
+	}
+	// Decrement connection count when done.
 	defer func() {
-		activeTCPMu.Lock()
-		delete(activeTCP, clientIP)
-		activeTCPMu.Unlock()
+		ipStore.Lock()
+		info.ConnCount--
+		ipStore.Unlock()
 	}()
 
-	// Update overall counters.
-	atomic.AddInt64(&tcpConnCount, 1)
-	ipEventCountsMu.Lock()
-	ipEventCounts[clientIP]++
-	ipEventCountsMu.Unlock()
-
-	// Smart protection via store.
-	ipRec := store.GetOrCreateIPData(clientIP)
-	ipRec.Lock.Lock()
-	ipRec.Data.Lastseen = time.Now()
-	if ipRec.Data.Blocked {
-		ipRec.Lock.Unlock()
-		client.Close()
-		return
-	}
-	// Read initial data (if any) for additional checks.
-	client.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buf := make([]byte, 1024)
+	// Read initial data for a handshake check.
+	client.SetReadDeadline(time.Now().Add(readTimeout))
+	buf := make([]byte, 512)
 	n, err := client.Read(buf)
 	client.SetReadDeadline(time.Time{})
-	if err == nil && n > 0 {
-		// Log the initial data (up to 64 bytes).
-		log.Printf("[TCP] Initial packet from %s: %q", clientAddr, string(buf[:min(n, 64)]))
-		// Accumulate data size.
-		ipRec.Data.Data += int64(n)
-		// Smart check: if TCP data exceeds threshold.
-		if btom(ipRec.Data.Data) > TCPDataThresholdMB {
-			ipRec.Data.OffenseCount++
-			if time.Since(ipRec.Data.FirstSeen) >= gracePeriod && ipRec.Data.OffenseCount >= maxOffense {
-				banIP(clientIP)
-				ipRec.Data.Blocked = true
-				ipRec.Lock.Unlock()
-				client.Close()
-				return
-			}
-		}
-	} else if err != nil && err != io.EOF {
-		log.Printf("[TCP] Error reading from %s: %v", clientAddr, err)
-		ipRec.Lock.Unlock()
-		client.Close()
+	if err != nil {
+		logError(fmt.Sprintf("[TCP] Error reading initial data from %s: %v", ip, err))
 		return
 	}
-	ipRec.Lock.Unlock()
+	if n == 0 {
+		logWarn(fmt.Sprintf("[TCP] Received zero bytes from %s", ip))
+		return
+	}
+	initialData := buf[:n]
+	if !isValidHTTPHeader(initialData) {
+		banIP(ip, "Invalid HTTP request header", discordWebhook)
+		return
+	}
+	// If it passes our heuristic, mark IP as whitelisted.
+	ipStore.setState(ip, Whitelisted)
+	logInfo(fmt.Sprintf("[TCP] Whitelisted IP %s after valid HTTP handshake", ip))
 
+	// Forward the connection including the already-read initial data.
+	forwardTCPWithInitial(client, targetIP, targetPort, initialData)
+}
+
+// forwardTCPWithInitial proxies data from client to backend, first sending initial data.
+func forwardTCPWithInitial(client net.Conn, targetIP, targetPort string, initial []byte) {
 	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
-		log.Printf("[TCP] Error connecting to backend for %s: %v", clientAddr, err)
-		client.Close()
+		logError(fmt.Sprintf("[TCP] Error connecting to backend: %v", err))
 		return
 	}
 	defer backend.Close()
-
-	// Send initial data if any.
-	if n > 0 {
-		_, _ = backend.Write(buf[:n])
+	if len(initial) > 0 {
+		backend.Write(initial)
 	}
-
-	// Proxy data bidirectionally.
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(backend, client)
@@ -501,46 +305,74 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 		done <- struct{}{}
 	}()
 	<-done
-	log.Printf("[TCP] Connection from %s closed after %v", clientAddr, time.Since(startTime))
 }
 
-func startTCPProxy(listenPort, targetIP, targetPort string) {
+// forwardTCP simply proxies data without extra steps.
+func forwardTCP(client net.Conn, targetIP, targetPort string) {
+	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
+	if err != nil {
+		logError(fmt.Sprintf("[TCP] Error connecting to backend: %v", err))
+		return
+	}
+	defer backend.Close()
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(backend, client)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(client, backend)
+		done <- struct{}{}
+	}()
+	<-done
+}
+
+func startTCPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	ln, err := net.Listen("tcp", ":"+listenPort)
 	if err != nil {
-		log.Fatalf("[TCP] Error starting listener on port %s: %v", listenPort, err)
+		logError(fmt.Sprintf("[TCP] Listen error on port %s: %v", listenPort, err))
+		os.Exit(1)
 	}
 	defer ln.Close()
-	log.Printf("[TCP] Proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
+	logInfo(fmt.Sprintf("[TCP] Proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort))
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("[TCP] Accept error: %v", err)
+			logWarn(fmt.Sprintf("[TCP] Accept error: %v", err))
 			continue
 		}
-		go handleTCPConnection(conn, targetIP, targetPort)
+		go handleTCPConnection(conn, targetIP, targetPort, discordWebhook)
 	}
 }
 
-// ------------------------
-// UDP Proxy Section (Naive NAT style)
-// ------------------------
+// ----------------------------------------------------------------------
+// UDP Proxy (Only forward from whitelisted IPs)
+// ----------------------------------------------------------------------
 
 type udpEntry struct {
 	backendConn *net.UDPConn
 	lastSeen    time.Time
 }
 
-func startUDPProxy(listenPort, targetIP, targetPort string) {
+func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
-		log.Fatalf("[UDP] Error resolving UDP address: %v", err)
+		logError(fmt.Sprintf("[UDP] Resolve error: %v", err))
+		os.Exit(1)
 	}
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatalf("[UDP] Error listening on UDP port %s: %v", listenPort, err)
+		logError(fmt.Sprintf("[UDP] Listen error on port %s: %v", listenPort, err))
+		os.Exit(1)
 	}
 	defer conn.Close()
-	log.Printf("[UDP] Proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort)
+	logInfo(fmt.Sprintf("[UDP] Proxy listening on port %s, forwarding to %s:%s", listenPort, targetIP, targetPort))
+
+	targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
+	if err != nil {
+		logError(fmt.Sprintf("[UDP] Could not resolve backend %s:%s: %v", targetIP, targetPort, err))
+		os.Exit(1)
+	}
 
 	backendMap := make(map[string]*udpEntry)
 	var mu sync.Mutex
@@ -548,82 +380,42 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 	for {
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[UDP] Read error: %v", err)
+			logWarn(fmt.Sprintf("[UDP] Read error: %v", err))
 			continue
 		}
-		clientKey := clientAddr.String()
-		clientIP := strings.Split(clientKey, ":")[0]
-		uniqueIPs.Store(clientIP, true)
-		// Count event only if no active TCP exists.
-		activeTCPMu.RLock()
-		_, active := activeTCP[clientIP]
-		activeTCPMu.RUnlock()
-		if !active {
-			ipEventCountsMu.Lock()
-			ipEventCounts[clientIP]++
-			ipEventCountsMu.Unlock()
-		}
-		bannedIPsMu.RLock()
-		if banned, exists := bannedIPs[clientIP]; exists && banned {
-			bannedIPsMu.RUnlock()
-			log.Printf("[UDP] Dropping packet from banned IP %s", clientIP)
+		ip := clientAddr.IP.String()
+		info := ipStore.getOrCreate(ip)
+		if info.State != Whitelisted {
+			logWarn(fmt.Sprintf("[UDP] Dropping packet from non-whitelisted IP %s", ip))
 			continue
 		}
-		bannedIPsMu.RUnlock()
-
-		// Smart protection update for UDP.
-		ipRec := store.GetOrCreateIPData(clientIP)
-		ipRec.Lock.Lock()
-		ipRec.Data.Lastseen = time.Now()
-		ipRec.Data.Data += int64(n)
-		if btom(ipRec.Data.Data) > UDPDataThresholdMB {
-			ipRec.Data.OffenseCount++
-			if time.Since(ipRec.Data.FirstSeen) >= gracePeriod && ipRec.Data.OffenseCount >= maxOffense {
-				banIP(clientIP)
-				ipRec.Data.Blocked = true
-				ipRec.Lock.Unlock()
-				continue
-			}
-		}
-		ipRec.Lock.Unlock()
-
-		atomic.AddInt64(&udpPacketCount, 1)
 		mu.Lock()
-		entry, found := backendMap[clientKey]
+		entry, found := backendMap[clientAddr.String()]
 		if !found {
-			targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
-			if err != nil {
-				log.Printf("[UDP] Error resolving target address: %v", err)
-				mu.Unlock()
-				continue
-			}
 			bc, err := net.DialUDP("udp", nil, targetAddr)
 			if err != nil {
-				log.Printf("[UDP] Error dialing backend for %s: %v", clientKey, err)
+				logError(fmt.Sprintf("[UDP] Dial error: %v", err))
 				mu.Unlock()
 				continue
 			}
-			entry = &udpEntry{
-				backendConn: bc,
-				lastSeen:    time.Now(),
-			}
-			backendMap[clientKey] = entry
-			go func(client *net.UDPAddr, backendConn *net.UDPConn, key string) {
-				bBuf := make([]byte, 2048)
+			entry = &udpEntry{backendConn: bc, lastSeen: time.Now()}
+			backendMap[clientAddr.String()] = entry
+
+			go func(ca *net.UDPAddr, bc *net.UDPConn, key string) {
+				backendBuf := make([]byte, 2048)
 				for {
-					backendConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-					n2, _, err2 := backendConn.ReadFromUDP(bBuf)
+					bc.SetReadDeadline(time.Now().Add(2 * time.Minute))
+					n2, _, err2 := bc.ReadFromUDP(backendBuf)
 					if err2 != nil {
-						log.Printf("[UDP] Closing connection for %s: %v", key, err2)
-						backendConn.Close()
+						bc.Close()
 						mu.Lock()
 						delete(backendMap, key)
 						mu.Unlock()
 						return
 					}
-					conn.WriteToUDP(bBuf[:n2], client)
+					conn.WriteToUDP(backendBuf[:n2], ca)
 				}
-			}(clientAddr, entry.backendConn, clientKey)
+			}(clientAddr, bc, clientAddr.String())
 		}
 		entry.lastSeen = time.Now()
 		_, _ = entry.backendConn.Write(buf[:n])
@@ -631,16 +423,15 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 	}
 }
 
-// ------------------------
-// Main Function
-// ------------------------
+// ----------------------------------------------------------------------
+// MAIN
+// ----------------------------------------------------------------------
 
 func main() {
-	// Read pterodactyl (or custom) variables via flags.
 	targetIP := flag.String("targetIP", "", "Backend server IP address")
 	targetPort := flag.String("targetPort", "", "Backend server port")
 	listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
-	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL for DDoS alerts (optional)")
+	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL for alerts (optional)")
 	flag.Parse()
 
 	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
@@ -648,28 +439,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Ensure required ipsets exist.
-	if err := ensureIPSet("whitelist"); err != nil {
-		log.Fatalf("Failed to ensure ipset 'whitelist': %v", err)
-	}
-	if err := ensureIPSet("backends"); err != nil {
-		log.Fatalf("Failed to ensure ipset 'backends': %v", err)
-	}
-	if err := ensureIPSet("banlist_perm"); err != nil {
-		log.Fatalf("Failed to ensure ipset 'banlist_perm': %v", err)
-	}
-
-	// Start background routines.
-	go func() {
-		ticker := time.NewTicker(IntervalDuration)
-		defer ticker.Stop()
-		for range ticker.C {
-			processInterval(*discordWebhook)
-		}
-	}()
-	go resetStore()
-
-	// Start proxy servers.
-	go startTCPProxy(*listenPort, *targetIP, *targetPort)
-	startUDPProxy(*listenPort, *targetIP, *targetPort)
+	// Start the TCP and UDP proxies concurrently.
+	go startTCPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
+	startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 }
