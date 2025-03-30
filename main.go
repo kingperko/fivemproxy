@@ -243,7 +243,7 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	
+
 	// Copy from client to backend.
 	go func() {
 		defer wg.Done()
@@ -258,7 +258,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 			backend.Close()
 		}
 	}()
-	
+
 	// Copy from backend to client.
 	go func() {
 		defer wg.Done()
@@ -273,7 +273,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 			client.Close()
 		}
 	}()
-	
+
 	wg.Wait()
 	log.Printf(">> [TCP] [%s] Connection closed", clientIP)
 }
@@ -292,8 +292,9 @@ type sessionData struct {
 var (
 	sessionMap   = make(map[string]*sessionData)
 	sessionMu    sync.Mutex
-	cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions
-	sessionTTL   = 600 * time.Second // Idle timeout duration (10 minutes)
+	// The cleanupTimer and sessionTTL are now unused because we are not dropping idle sessions.
+	cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions (unused)
+	sessionTTL   = 600 * time.Second // Idle timeout duration (unused)
 )
 
 // For UDP handshake tracking.
@@ -330,9 +331,10 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		log.Fatalf(">> [UDP] Error resolving backend address: %v", err)
 	}
 
-	// Start DDoS monitoring and session cleanup.
+	// Start DDoS monitoring.
 	go monitorDDoS(discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", targetIP, listenPort), targetPort)
-	go cleanupSessions()
+	// Removed idle session cleanup to keep sessions alive indefinitely.
+	// go cleanupSessions()
 
 	buf := make([]byte, 2048)
 	for {
@@ -394,6 +396,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			sessionMap[clientAddr.String()] = sd
 			go handleUDPSession(listenConn, sd)
 		} else {
+			// Update lastActive timestamp, although we won't close idle sessions.
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
@@ -428,35 +431,16 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 			log.Printf(">> [UDP] Error writing to client %s: %v", sd.clientAddr, err)
 		}
 	}
-	cleanupSession(sd.clientAddr.String())
+	// Do not clean up session automatically on error; connection remains until the client really leaves.
 }
 
+// ------------------------
+// Idle Session Cleanup (Disabled)
+// ------------------------
+
+// cleanupSessions is now a no-op so that idle UDP sessions remain alive indefinitely.
 func cleanupSessions() {
-	ticker := time.NewTicker(cleanupTimer)
-	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now()
-		sessionMu.Lock()
-		for key, sd := range sessionMap {
-			if now.Sub(sd.lastActive) > sessionTTL {
-				log.Printf(">> [UDP] Closing idle session for client %s", sd.clientAddr)
-				cleanupSession(key)
-			}
-		}
-		sessionMu.Unlock()
-	}
-}
-
-func cleanupSession(key string) {
-	sessionMu.Lock()
-	sd, exists := sessionMap[key]
-	if exists {
-		delete(sessionMap, key)
-		sd.closeOnce.Do(func() {
-			sd.backendConn.Close()
-		})
-	}
-	sessionMu.Unlock()
+	// Idle cleanup disabled: do nothing.
 }
 
 // ------------------------
