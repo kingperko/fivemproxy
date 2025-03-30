@@ -81,7 +81,7 @@ var (
 	bannedIPs   = make(map[string]bool)
 	bannedIPsMu sync.RWMutex
 
-	// A simple TCP connection counter.
+	// A simple TCP connection counter (for reference/logging).
 	tcpConnCount int64
 )
 
@@ -110,8 +110,8 @@ func banIP(ip string) {
 // Handshake Detection
 // ------------------------
 
-// isLegitHandshake now accepts raw bytes and returns true if the data indicates a
-// TLS handshake (common for FiveM) or contains known plaintext keywords.
+// isLegitHandshake returns true if the data indicates a
+// TLS handshake (common for FiveM) or known plaintext keywords.
 func isLegitHandshake(data []byte) bool {
 	// Check for TLS handshake: record type 0x16 with version 0x03 and version byte 0x00-0x03.
 	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x00 && data[2] <= 0x03) {
@@ -174,6 +174,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	updateWhitelist(clientIP)
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf(">> [TCP] [%s] Authenticated and whitelisted", clientIP)
+
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientIP, err)
@@ -182,7 +183,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	defer backendConn.Close()
 
 	// Forward the handshake to the backend.
-	backendConn.Write(buf[:n])
+	_, _ = backendConn.Write(buf[:n])
 	proxyTCPWithConn(conn, backendConn, clientIP)
 }
 
@@ -251,16 +252,10 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// Validate handshake.
-		if !isWhitelisted(clientIP) && !isLegitHandshake(buf[:n]) {
-			log.Printf(">> [UDP] Dropped packet from %s - invalid handshake", clientIP)
-			banIP(clientIP)
-			sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious UDP packet detected. Connection dropped.", 0xff0000)
-			continue
-		}
+		// Drop packet if IP is not whitelisted.
 		if !isWhitelisted(clientIP) {
-			updateWhitelist(clientIP)
-			log.Printf(">> [UDP] [%s] Whitelisted via UDP handshake", clientIP)
+			log.Printf(">> [UDP] Dropped packet from %s - not whitelisted", clientIP)
+			continue
 		}
 
 		// Forward packet to backend.
@@ -275,6 +270,8 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			backendConn.Close()
 			continue
 		}
+
+		// Attempt to read response from backend.
 		respBuf := make([]byte, 2048)
 		backendConn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		n2, err := backendConn.Read(respBuf)
@@ -283,22 +280,13 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			log.Printf(">> [UDP] Read from backend error: %v", err)
 			continue
 		}
+
+		// Send response back to client.
 		_, err = conn.WriteToUDP(respBuf[:n2], clientAddr)
 		if err != nil {
 			log.Printf(">> [UDP] Write to client error: %v", err)
 		}
 	}
-}
-
-// ------------------------
-// Utility Functions
-// ------------------------
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ------------------------
