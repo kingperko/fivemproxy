@@ -402,9 +402,9 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 	var peakMbps float64
 	var belowCount int
 
-	// Set thresholds (adjust these as needed).
-	const ppsThreshold = 1000 // packets per second threshold
-	const mbpsThreshold = 1.0 // Mbps threshold
+	// Set thresholds very low so any attack gets logged.
+	const ppsThreshold = 1    // any nonzero packets
+	const mbpsThreshold = 0.01 // any measurable throughput
 
 	for range ticker.C {
 		pps := atomic.LoadUint64(&ddosPacketCount) / 10
@@ -495,7 +495,7 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy (runs in main goroutine).
+	// Start UDP proxy in a goroutine.
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
 	// Start DDoS monitoring.
