@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,9 +131,15 @@ func isLegitHandshake(data []byte) bool {
 // TCP Proxy Logic
 // ------------------------
 
+// If your FiveM (or other) server supports the PROXY protocol v1, we can send
+// the real client IP to the server. If not, set proxyProtocol = false.
+var proxyProtocol = true
+
 func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook string) {
 	defer conn.Close()
-	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
+	clientAddr := conn.RemoteAddr().(*net.TCPAddr)
+	clientIP := clientAddr.IP.String()
+	clientPort := clientAddr.Port
 
 	// Immediately drop if IP is banned.
 	bannedIPsMu.RLock()
@@ -146,7 +153,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	// If already whitelisted, just proxy.
 	if isWhitelisted(clientIP) {
 		log.Printf(">> [TCP] [%s] Whitelisted - connection allowed", clientIP)
-		proxyTCP(conn, targetIP, targetPort)
+		proxyTCP(conn, targetIP, targetPort, clientAddr)
 		return
 	}
 
@@ -175,27 +182,43 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf(">> [TCP] [%s] Authenticated and whitelisted", clientIP)
 
-	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
-	if err != nil {
-		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientIP, err)
-		return
-	}
-	defer backendConn.Close()
-
-	// Forward the handshake to the backend.
-	_, _ = backendConn.Write(buf[:n])
-	proxyTCPWithConn(conn, backendConn, clientIP)
+	// Now connect to the backend.
+	proxyTCPWithHandshake(conn, targetIP, targetPort, clientAddr, buf[:n])
 }
 
-// proxyTCP establishes a backend connection and pipes data.
-func proxyTCP(client net.Conn, targetIP, targetPort string) {
+// proxyTCP is used if we already know the client is whitelisted. We skip handshake checks.
+func proxyTCP(client net.Conn, targetIP, targetPort string, clientAddr *net.TCPAddr) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf(">> [TCP] Backend dial error: %v", err)
 		return
 	}
 	defer backendConn.Close()
-	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
+
+	if proxyProtocol {
+		sendProxyProtocolHeader(backendConn, clientAddr, targetIP, targetPort)
+	}
+
+	proxyTCPWithConn(client, backendConn, clientAddr.String())
+}
+
+// proxyTCPWithHandshake sends the initial handshake data to the backend after
+// optionally sending the PROXY protocol header.
+func proxyTCPWithHandshake(client net.Conn, targetIP, targetPort string, clientAddr *net.TCPAddr, initialData []byte) {
+	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
+	if err != nil {
+		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientAddr.IP, err)
+		return
+	}
+	defer backendConn.Close()
+
+	if proxyProtocol {
+		sendProxyProtocolHeader(backendConn, clientAddr, targetIP, targetPort)
+	}
+
+	// Forward the handshake data first
+	_, _ = backendConn.Write(initialData)
+	proxyTCPWithConn(client, backendConn, clientAddr.String())
 }
 
 // proxyTCPWithConn pipes data between two connections.
@@ -213,14 +236,27 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	log.Printf(">> [TCP] [%s] Connection closed", clientIP)
 }
 
+// sendProxyProtocolHeader sends a PROXY protocol v1 header with the real client IP/port.
+func sendProxyProtocolHeader(backendConn net.Conn, clientAddr *net.TCPAddr, targetIP, targetPort string) {
+	// Example: PROXY TCP4 1.2.3.4 5.6.7.8 12345 30120\r\n
+	localPort, _ := strconv.Atoi(targetPort)
+	header := fmt.Sprintf("PROXY TCP4 %s %s %d %d\r\n",
+		clientAddr.IP.String(),
+		targetIP,
+		clientAddr.Port,
+		localPort,
+	)
+	backendConn.Write([]byte(header))
+}
+
 // ------------------------
 // NAT-based UDP Proxy Logic
 // ------------------------
 
 // sessionData holds info about each client -> backend session
 type sessionData struct {
-	clientAddr  *net.UDPAddr // the original client
-	lastActive  time.Time    // last time we saw traffic
+	clientAddr *net.UDPAddr // the original client
+	lastActive time.Time    // last time we saw traffic
 }
 
 // We keep a single backendConn for all traffic to the backend
@@ -310,7 +346,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 }
 
 // handleBackendResponses reads packets from the backendConn and forwards them
-// to the correct client based on sessionMap.
+// to the correct client(s) based on sessionMap.
 func handleBackendResponses(listenConn, backendConn *net.UDPConn) {
 	buf := make([]byte, 2048)
 	for {
@@ -325,26 +361,16 @@ func handleBackendResponses(listenConn, backendConn *net.UDPConn) {
 			continue
 		}
 
-		// In a NAT scenario, the backend doesn't know the original client's address.
-		// Typically, for many game servers, the response is "matched" to the correct
-		// client by content or the server only expects a single client. If your
-		// backend includes some info to identify the client, you'd parse it here.
-
-		// For FiveM or typical game servers, each client has their own "conversation"
-		// with the server. But all server responses come back to the same local port.
-		// If your server sends back multiple responses for multiple clients, you
-		// need a more advanced matching technique (like reading embedded IDs).
+		// For many game servers (including FiveM), the server doesn't embed
+		// the "original client IP" in the response. So we can't do a perfect
+		// match. If your server truly needs multi-client support, you typically
+		// need custom logic or server modifications to track which response
+		// belongs to which client.
 		//
-		// If your server is effectively only talking to one client at a time, or
-		// doesn't need multiple simultaneous connections, you can simply forward
-		// all responses to the last active client. For multi-client scenarios,
-		// there's no perfect solution without additional logic or data in the packet.
-
-		// --- Simple approach: forward to every active client (not ideal for large servers).
-		// This is a fallback if the server doesn't embed any info to identify the client.
+		// The simplest approach: forward the backend's response to *all*
+		// currently active sessions. For single or small # of clients, it "just works".
 		sessionMu.Lock()
 		for _, sd := range sessionMap {
-			// As a naive approach, forward to all active clients:
 			_, werr := listenConn.WriteToUDP(buf[:n], sd.clientAddr)
 			if werr != nil {
 				log.Printf(">> [UDP] Write to client %s error: %v", sd.clientAddr, werr)
