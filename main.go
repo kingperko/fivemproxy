@@ -86,7 +86,7 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
         // Forward the handshake data we just read:
         _, _ = backend.Write(buf[:n])
 
-        // Start piping rest of traffic in goroutines:
+        // Start piping the rest of the traffic in goroutines:
         go io.Copy(backend, client)
         io.Copy(client, backend)
         return
