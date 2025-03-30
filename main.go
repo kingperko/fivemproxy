@@ -31,6 +31,7 @@ type discordWebhookBody struct {
 	Embeds   []discordEmbed `json:"embeds"`
 }
 
+// sendDiscordEmbed sends a brief, formatted message to Discord.
 func sendDiscordEmbed(webhookURL, title, description string, color int) {
 	if webhookURL == "" {
 		return
@@ -84,18 +85,21 @@ var (
 	tcpConnCount int64
 )
 
+// updateWhitelist adds an IP to the whitelist.
 func updateWhitelist(ip string) {
 	whitelistedIPsMu.Lock()
 	whitelistedIPs[ip] = true
 	whitelistedIPsMu.Unlock()
 }
 
+// isWhitelisted returns true if the IP is already whitelisted.
 func isWhitelisted(ip string) bool {
 	whitelistedIPsMu.RLock()
 	defer whitelistedIPsMu.RUnlock()
 	return whitelistedIPs[ip]
 }
 
+// banIP adds an IP to the banned list.
 func banIP(ip string) {
 	bannedIPsMu.Lock()
 	bannedIPs[ip] = true
@@ -106,6 +110,8 @@ func banIP(ip string) {
 // Handshake Detection
 // ------------------------
 
+// isLegitHandshake now accepts raw bytes and returns true if the data indicates a
+// TLS handshake (common for FiveM) or contains known plaintext keywords.
 func isLegitHandshake(data []byte) bool {
 	// Check for TLS handshake: record type 0x16 with version 0x03 and version byte 0x00-0x03.
 	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x00 && data[2] <= 0x03) {
@@ -180,6 +186,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	proxyTCPWithConn(conn, backendConn, clientIP)
 }
 
+// proxyTCP establishes a backend connection and pipes data.
 func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -190,6 +197,7 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
 }
 
+// proxyTCPWithConn pipes data between two connections.
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	done := make(chan struct{}, 2)
 	go func() {
@@ -280,6 +288,17 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			log.Printf(">> [UDP] Write to client error: %v", err)
 		}
 	}
+}
+
+// ------------------------
+// Utility Functions
+// ------------------------
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ------------------------
