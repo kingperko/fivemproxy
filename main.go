@@ -19,9 +19,9 @@ import (
 	"time"
 )
 
-// ----------------------------------------------------------------------
+// ------------------------
 // Custom Structured Logging
-// ----------------------------------------------------------------------
+// ------------------------
 
 type LogLevel string
 
@@ -48,9 +48,9 @@ func logError(msg string) {
 	logMsg(ERROR, msg)
 }
 
-// ----------------------------------------------------------------------
+// ------------------------
 // Discord Notification (Optional)
-// ----------------------------------------------------------------------
+// ------------------------
 
 type discordEmbed struct {
 	Title       string `json:"title,omitempty"`
@@ -99,11 +99,10 @@ func sendDiscordNotification(webhookURL, title, description string, color int) {
 	}
 }
 
-// ----------------------------------------------------------------------
+// ------------------------
 // IP Tracking & Rate Limiting
-// ----------------------------------------------------------------------
+// ------------------------
 
-// IPState indicates whether an IP is Unknown, Whitelisted, or Blocked.
 type IPState int
 
 const (
@@ -112,13 +111,12 @@ const (
 	Blocked
 )
 
-// IPInfo holds per-IP data.
 type IPInfo struct {
 	State         IPState
-	ConnCount     int       // active TCP connections count
+	ConnCount     int       // active TCP connection count
 	FirstSeen     time.Time // when first seen
 	NewConnBurst  int       // count of new connections in a burst
-	LastBurstTime time.Time // when the burst counter was last reset
+	LastBurstTime time.Time // when burst counter was last reset
 }
 
 type IPStore struct {
@@ -158,18 +156,16 @@ func (s *IPStore) setState(ip string, state IPState) {
 
 var ipStore = newIPStore()
 
-// Ban an IP: mark it as Blocked and send a Discord alert.
 func banIP(ip, reason, discordWebhook string) {
 	ipStore.setState(ip, Blocked)
 	logWarn(fmt.Sprintf("BANNED: IP %s blocked. Reason: %s", ip, reason))
 	go sendDiscordNotification(discordWebhook, "IP Banned", fmt.Sprintf("IP: %s\nReason: %s", ip, reason), 0xff0000)
 }
 
-// ----------------------------------------------------------------------
+// ------------------------
 // Heuristic HTTP Request Check
-// ----------------------------------------------------------------------
+// ------------------------
 
-// isValidHTTPHeader checks if the initial data appears to be a valid HTTP request.
 func isValidHTTPHeader(data []byte) bool {
 	header := string(data)
 	validMethods := []string{"GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS "}
@@ -193,16 +189,15 @@ func isValidHTTPHeader(data []byte) bool {
 	return true
 }
 
-// ----------------------------------------------------------------------
+// ------------------------
 // TCP Proxy with HTTP Heuristics
-// ----------------------------------------------------------------------
+// ------------------------
 
 const readTimeout = 3 * time.Second
 
-// Thresholds for rate limiting.
 const (
-	maxNewConnBurst    = 10              // max new connections from an unknown IP in burstWindow
-	burstWindow        = 5 * time.Second // burst window duration
+	maxNewConnBurst    = 10              // max new connections from an unknown IP in burst window
+	burstWindow        = 5 * time.Second // duration for burst window
 	maxConcurrentConns = 5               // max concurrent connections per IP
 )
 
@@ -217,7 +212,7 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook s
 		return
 	}
 
-	// Rate-limit new connections from unknown IPs.
+	// Rate limit new connections.
 	now := time.Now()
 	ipStore.Lock()
 	if now.Sub(info.LastBurstTime) > burstWindow {
@@ -228,7 +223,7 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook s
 	currentBurst := info.NewConnBurst
 	ipStore.Unlock()
 	if info.State == Unknown && currentBurst > maxNewConnBurst {
-		banIP(ip, "Excessive new connection bursts", discordWebhook)
+		banIP(ip, "Excessive connection bursts", discordWebhook)
 		return
 	}
 
@@ -247,13 +242,13 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook s
 		return
 	}
 
-	// Read initial data from the client.
+	// Read initial data.
 	client.SetReadDeadline(time.Now().Add(readTimeout))
 	buf := make([]byte, 512)
 	n, err := client.Read(buf)
 	client.SetReadDeadline(time.Time{})
 	if err != nil {
-		logError(fmt.Sprintf("[TCP] Error reading initial data from %s: %v", ip, err))
+		logError(fmt.Sprintf("[TCP] Error reading from %s: %v", ip, err))
 		return
 	}
 	if n == 0 {
@@ -262,11 +257,11 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook s
 	}
 	initialData := buf[:n]
 	if !isValidHTTPHeader(initialData) {
-		banIP(ip, "Invalid HTTP request header", discordWebhook)
+		banIP(ip, "Invalid HTTP header", discordWebhook)
 		return
 	}
 
-	// Passed the heuristic check: mark as whitelisted.
+	// Mark IP as whitelisted.
 	ipStore.setState(ip, Whitelisted)
 	logInfo(fmt.Sprintf("[TCP] Whitelisted IP %s after valid HTTP handshake", ip))
 	forwardTCPWithInitial(client, targetIP, targetPort, initialData)
@@ -282,25 +277,6 @@ func forwardTCPWithInitial(client net.Conn, targetIP, targetPort string, initial
 	if len(initial) > 0 {
 		backend.Write(initial)
 	}
-	done := make(chan struct{}, 2)
-	go func() {
-		io.Copy(backend, client)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(client, backend)
-		done <- struct{}{}
-	}()
-	<-done
-}
-
-func forwardTCP(client net.Conn, targetIP, targetPort string) {
-	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
-	if err != nil {
-		logError(fmt.Sprintf("[TCP] Error connecting to backend: %v", err))
-		return
-	}
-	defer backend.Close()
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(backend, client)
@@ -331,9 +307,9 @@ func startTCPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 }
 
-// ----------------------------------------------------------------------
+// ------------------------
 // UDP Proxy (Only forward from whitelisted IPs)
-// ----------------------------------------------------------------------
+// ------------------------
 
 type udpEntry struct {
 	backendConn *net.UDPConn
@@ -406,9 +382,9 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 }
 
-// ----------------------------------------------------------------------
+// ------------------------
 // MAIN
-// ----------------------------------------------------------------------
+// ------------------------
 
 func main() {
 	targetIP := flag.String("targetIP", "", "Backend server IP address")
@@ -422,7 +398,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start the TCP and UDP proxies concurrently.
 	go startTCPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 	startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 }
