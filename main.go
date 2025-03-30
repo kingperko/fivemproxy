@@ -22,14 +22,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start TCP proxy in a goroutine.
+	// Start the TCP proxy.
 	go startTCPProxy(*listenPort, *targetIP, *targetPort)
 
-	// Start UDP proxy (blocks).
+	// Start the UDP proxy.
 	startUDPProxy(*listenPort, *targetIP, *targetPort)
 }
 
-// startTCPProxy listens on the given TCP port and forwards connections to the backend.
+// startTCPProxy listens on the specified TCP port and forwards connections to the backend.
 func startTCPProxy(listenPort, targetIP, targetPort string) {
 	ln, err := net.Listen("tcp", ":"+listenPort)
 	if err != nil {
@@ -46,10 +46,9 @@ func startTCPProxy(listenPort, targetIP, targetPort string) {
 	}
 }
 
-// handleTCPConnection copies data bidirectionally between the client and the backend.
+// handleTCPConnection forwards data bidirectionally between the client and the backend.
 func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	defer client.Close()
-
 	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf("TCP: Error connecting to backend: %v", err)
@@ -74,7 +73,7 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	log.Printf("TCP: Connection from %s closed", client.RemoteAddr().String())
 }
 
-// startUDPProxy listens on the given UDP port and forwards packets to the backend.
+// startUDPProxy listens on the specified UDP port and forwards packets to the backend.
 func startUDPProxy(listenPort, targetIP, targetPort string) {
 	addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
@@ -104,15 +103,13 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 			log.Printf("UDP: Error reading: %v", err)
 			continue
 		}
-
-		// Forward the packet to the backend.
+		// Forward UDP data to backend.
 		_, err = backendConn.Write(buf[:n])
 		if err != nil {
 			log.Printf("UDP: Error writing to backend: %v", err)
 			continue
 		}
-
-		// Read response from the backend (with a short timeout) and send it back to the client.
+		// Read response from backend with a short timeout.
 		backendConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		n2, err := backendConn.Read(buf)
 		if err == nil && n2 > 0 {
