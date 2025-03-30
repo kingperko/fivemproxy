@@ -128,18 +128,17 @@ func isLegitHandshake(data []byte) bool {
 }
 
 // ------------------------
-// TCP Proxy Logic
+// TCP Proxy Logic (optional)
 // ------------------------
 
-// If your FiveM (or other) server supports the PROXY protocol v1, we can send
-// the real client IP to the server. If not, set proxyProtocol = false.
+// If you don't need TCP, you can remove or disable this section.
 var proxyProtocol = true
 
 func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook string) {
 	defer conn.Close()
 	clientAddr := conn.RemoteAddr().(*net.TCPAddr)
 	clientIP := clientAddr.IP.String()
-	clientPort := clientAddr.Port
+	// Removed unused variable: clientPort
 
 	// Immediately drop if IP is banned.
 	bannedIPsMu.RLock()
@@ -182,11 +181,9 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf(">> [TCP] [%s] Authenticated and whitelisted", clientIP)
 
-	// Now connect to the backend.
 	proxyTCPWithHandshake(conn, targetIP, targetPort, clientAddr, buf[:n])
 }
 
-// proxyTCP is used if we already know the client is whitelisted. We skip handshake checks.
 func proxyTCP(client net.Conn, targetIP, targetPort string, clientAddr *net.TCPAddr) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -202,8 +199,6 @@ func proxyTCP(client net.Conn, targetIP, targetPort string, clientAddr *net.TCPA
 	proxyTCPWithConn(client, backendConn, clientAddr.String())
 }
 
-// proxyTCPWithHandshake sends the initial handshake data to the backend after
-// optionally sending the PROXY protocol header.
 func proxyTCPWithHandshake(client net.Conn, targetIP, targetPort string, clientAddr *net.TCPAddr, initialData []byte) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -216,12 +211,10 @@ func proxyTCPWithHandshake(client net.Conn, targetIP, targetPort string, clientA
 		sendProxyProtocolHeader(backendConn, clientAddr, targetIP, targetPort)
 	}
 
-	// Forward the handshake data first
 	_, _ = backendConn.Write(initialData)
 	proxyTCPWithConn(client, backendConn, clientAddr.String())
 }
 
-// proxyTCPWithConn pipes data between two connections.
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	done := make(chan struct{}, 2)
 	go func() {
@@ -236,9 +229,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	log.Printf(">> [TCP] [%s] Connection closed", clientIP)
 }
 
-// sendProxyProtocolHeader sends a PROXY protocol v1 header with the real client IP/port.
 func sendProxyProtocolHeader(backendConn net.Conn, clientAddr *net.TCPAddr, targetIP, targetPort string) {
-	// Example: PROXY TCP4 1.2.3.4 5.6.7.8 12345 30120\r\n
 	localPort, _ := strconv.Atoi(targetPort)
 	header := fmt.Sprintf("PROXY TCP4 %s %s %d %d\r\n",
 		clientAddr.IP.String(),
@@ -250,29 +241,22 @@ func sendProxyProtocolHeader(backendConn net.Conn, clientAddr *net.TCPAddr, targ
 }
 
 // ------------------------
-// NAT-based UDP Proxy Logic
+// UDP Proxy Logic
 // ------------------------
 
-// sessionData holds info about each client -> backend session
 type sessionData struct {
-	clientAddr *net.UDPAddr // the original client
-	lastActive time.Time    // last time we saw traffic
+	clientAddr *net.UDPAddr
+	lastActive time.Time
 }
 
-// We keep a single backendConn for all traffic to the backend
-// and a map of client -> sessionData
 var (
 	sessionMap   = make(map[string]*sessionData)
 	sessionMu    sync.Mutex
-	cleanupTimer = 30 * time.Second  // how often we remove stale sessions
-	sessionTTL   = 120 * time.Second // how long to keep an inactive session
+	cleanupTimer = 30 * time.Second  // frequency for cleanup
+	sessionTTL   = 120 * time.Second // session inactivity TTL
 )
 
-// startUDPProxy sets up a single UDP connection to the backend and
-// spawns goroutines to handle both inbound (client->proxy) and
-// outbound (backend->proxy) traffic.
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
-	// 1) Listen for client traffic on listenPort
 	listenAddr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
 		log.Fatalf(">> [UDP] Error resolving listen address: %v", err)
@@ -283,7 +267,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 	log.Printf(">> [UDP] Listening on port %s", listenPort)
 
-	// 2) Dial the backend (single socket)
 	backendAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Fatalf(">> [UDP] Error resolving backend address: %v", err)
@@ -294,13 +277,9 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 	log.Printf(">> [UDP] Connected to backend %s:%s", targetIP, targetPort)
 
-	// 3) Start a goroutine to read from the backend and forward to clients
 	go handleBackendResponses(listenConn, backendConn)
-
-	// 4) Start a cleanup goroutine to remove stale sessions
 	go cleanupSessions()
 
-	// 5) Main loop: read from the client, forward to the backend
 	buf := make([]byte, 2048)
 	for {
 		n, clientAddr, err := listenConn.ReadFromUDP(buf)
@@ -310,7 +289,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 
 		clientIP := clientAddr.IP.String()
-		// Drop packet if IP is banned.
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
@@ -319,13 +297,11 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// Drop packet if IP is not whitelisted.
 		if !isWhitelisted(clientIP) {
 			log.Printf(">> [UDP] Dropped packet from %s - not whitelisted", clientIP)
 			continue
 		}
 
-		// Update or create session data
 		sessionMu.Lock()
 		sd, exists := sessionMap[clientAddr.String()]
 		if !exists {
@@ -336,7 +312,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		sessionMu.Unlock()
 
-		// Forward packet to the backend
 		_, err = backendConn.Write(buf[:n])
 		if err != nil {
 			log.Printf(">> [UDP] Write to backend error: %v", err)
@@ -345,8 +320,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 }
 
-// handleBackendResponses reads packets from the backendConn and forwards them
-// to the correct client(s) based on sessionMap.
 func handleBackendResponses(listenConn, backendConn *net.UDPConn) {
 	buf := make([]byte, 2048)
 	for {
@@ -354,21 +327,12 @@ func handleBackendResponses(listenConn, backendConn *net.UDPConn) {
 		n, _, err := backendConn.ReadFromUDP(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				// This is normal if there's no traffic, just continue
 				continue
 			}
 			log.Printf(">> [UDP] Error reading from backend: %v", err)
 			continue
 		}
 
-		// For many game servers (including FiveM), the server doesn't embed
-		// the "original client IP" in the response. So we can't do a perfect
-		// match. If your server truly needs multi-client support, you typically
-		// need custom logic or server modifications to track which response
-		// belongs to which client.
-		//
-		// The simplest approach: forward the backend's response to *all*
-		// currently active sessions. For single or small # of clients, it "just works".
 		sessionMu.Lock()
 		for _, sd := range sessionMap {
 			_, werr := listenConn.WriteToUDP(buf[:n], sd.clientAddr)
@@ -380,7 +344,6 @@ func handleBackendResponses(listenConn, backendConn *net.UDPConn) {
 	}
 }
 
-// cleanupSessions periodically removes stale sessions that haven't had traffic.
 func cleanupSessions() {
 	ticker := time.NewTicker(cleanupTimer)
 	defer ticker.Stop()
@@ -415,7 +378,7 @@ func main() {
 
 	log.Printf(">> [INFO] Starting proxy: forwarding to %s:%s on port %s", *targetIP, *targetPort, *listenPort)
 
-	// Start TCP proxy in a goroutine.
+	// Start TCP proxy in a goroutine (if needed)
 	go func() {
 		ln, err := net.Listen("tcp", ":"+*listenPort)
 		if err != nil {
@@ -433,7 +396,7 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy (runs in main goroutine).
+	// Start UDP proxy (runs in main goroutine)
 	startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 }
 
@@ -441,7 +404,6 @@ func main() {
 // Helper Function
 // ------------------------
 
-// min returns the smaller of two integers.
 func min(a, b int) int {
 	if a < b {
 		return a
