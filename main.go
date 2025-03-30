@@ -380,6 +380,6 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy (runs in main goroutine).
+	// Start UDP prxy (runs in main goroutine).
 	startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 }
