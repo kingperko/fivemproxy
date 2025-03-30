@@ -104,7 +104,8 @@ func banIP(ip string) {
 // ------------------------
 
 func isLegitHandshake(data []byte) bool {
-	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x00 && data[2] <= 0x03) {
+	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 &&
+		(data[2] >= 0x00 && data[2] <= 0x03) {
 		return true
 	}
 	lower := strings.ToLower(string(data))
@@ -199,17 +200,18 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 // ------------------------
 
 type sessionData struct {
-	clientAddr  *net.UDPAddr    // Client address
-	backendConn *net.UDPConn    // Persistent connection to backend for this client
-	lastActive  time.Time       // Last time this session was used
-	closeOnce   sync.Once       // To ensure session cleanup happens once
+	clientAddr  *net.UDPAddr // Client address
+	backendConn *net.UDPConn // Persistent connection to backend for this client
+	lastActive  time.Time    // Last time this session was used
+	closeOnce   sync.Once    // Ensures cleanup happens only once
 }
 
 var (
+	// Increased sessionTTL to 600 seconds (10 minutes) to reduce premature cleanup.
 	sessionMap   = make(map[string]*sessionData)
 	sessionMu    sync.Mutex
-	cleanupTimer = 30 * time.Second  // Cleanup check frequency
-	sessionTTL   = 120 * time.Second // Session idle timeout
+	cleanupTimer = 30 * time.Second  // Frequency for idle check
+	sessionTTL   = 600 * time.Second // Idle timeout duration (10 minutes)
 )
 
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
@@ -228,7 +230,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		log.Fatalf(">> [UDP] Error resolving backend address: %v", err)
 	}
 
-	// Start cleanup goroutine.
 	go cleanupSessions()
 
 	buf := make([]byte, 2048)
@@ -240,7 +241,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		clientIP := clientAddr.IP.String()
 
-		// Drop packet if IP is banned.
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
@@ -249,20 +249,18 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// Check handshake for new sessions.
+		// For new sessions, require a valid handshake.
 		if !isWhitelisted(clientIP) && !isLegitHandshake(buf[:n]) {
 			log.Printf(">> [UDP] Dropped packet from %s - invalid handshake", clientIP)
 			banIP(clientIP)
 			sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious UDP packet detected. Connection dropped.", 0xff0000)
 			continue
 		}
-		// Whitelist if not already.
 		if !isWhitelisted(clientIP) {
 			updateWhitelist(clientIP)
 			log.Printf(">> [UDP] [%s] Whitelisted via UDP handshake", clientIP)
 		}
 
-		// Get or create a persistent session.
 		sessionMu.Lock()
 		sd, exists := sessionMap[clientAddr.String()]
 		if !exists {
@@ -284,7 +282,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		sessionMu.Unlock()
 
-		// Forward the client's packet to its persistent backend connection.
 		_, err = sd.backendConn.Write(buf[:n])
 		if err != nil {
 			log.Printf(">> [UDP] Write to backend error for client %s: %v", clientIP, err)
@@ -293,8 +290,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 }
 
-// handleUDPSession continuously reads from the backend connection for a given session
-// and forwards responses to the client.
 func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 	buf := make([]byte, 2048)
 	for {
@@ -308,17 +303,19 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 			log.Printf(">> [UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
 			break
 		}
-		// Forward the response back to the client.
+		// Update session lastActive on every response.
+		sessionMu.Lock()
+		sd.lastActive = time.Now()
+		sessionMu.Unlock()
+
 		_, err = listenConn.WriteToUDP(buf[:n], sd.clientAddr)
 		if err != nil {
 			log.Printf(">> [UDP] Error writing to client %s: %v", sd.clientAddr, err)
 		}
 	}
-	// On error or closure, clean up the session.
 	cleanupSession(sd.clientAddr.String())
 }
 
-// cleanupSessions periodically removes sessions that have been idle too long.
 func cleanupSessions() {
 	ticker := time.NewTicker(cleanupTimer)
 	defer ticker.Stop()
@@ -335,7 +332,6 @@ func cleanupSessions() {
 	}
 }
 
-// cleanupSession closes and removes a session.
 func cleanupSession(key string) {
 	sessionMu.Lock()
 	sd, exists := sessionMap[key]
