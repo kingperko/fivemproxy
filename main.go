@@ -424,7 +424,6 @@ func cleanupSession(key string) {
 // ------------------------
 // DDoS Detection Logic
 // ------------------------
-
 func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -433,15 +432,21 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 	var peakMbps float64
 	var belowCount int
 
-	// Adjust these thresholds for your environment.
-	const ppsThreshold = 1000 // packets per second
-	const mbpsThreshold = 1.0 // 1.0 Mbps
+	// Thresholds – adjust these based on your environment.
+	const ppsThreshold = 1000        // packets per second
+	const mbpsThreshold = 1.0        // Mbps threshold
+	const bansThreshold = 10         // New bans in interval
+	const sessionsThreshold = 20     // New sessions in interval
 
 	for range ticker.C {
 		pps := atomic.LoadUint64(&ddosPacketCount) / 10
 		bytesCount := atomic.LoadUint64(&ddosByteCount)
 		mbps := (float64(bytesCount)*8/1e6)/10
 
+		newBans := atomic.LoadUint64(&newBansCounter)
+		newSessions := atomic.LoadUint64(&newSessionCounter)
+
+		// Update peak metrics.
 		if pps > peakPPS {
 			peakPPS = pps
 		}
@@ -449,14 +454,18 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 			peakMbps = mbps
 		}
 
+		// Reset counters.
 		atomic.StoreUint64(&ddosPacketCount, 0)
 		atomic.StoreUint64(&ddosByteCount, 0)
+		atomic.StoreUint64(&newBansCounter, 0)
+		atomic.StoreUint64(&newSessionCounter, 0)
 
 		ddosMutex.Lock()
-		if pps > ppsThreshold || mbps > mbpsThreshold {
+		// Use a combination of metrics: attack if any one exceeds or if a combination is high.
+		if pps > ppsThreshold || mbps > mbpsThreshold || newBans >= bansThreshold || newSessions >= sessionsThreshold {
 			if !ddosAttackActive {
 				sendDDoSAttackStarted(discordWebhook, serverName, serverIP,
-					fmt.Sprintf(":zap: %d PPS | :electric_plug: %.2f Mbps", pps, mbps),
+					fmt.Sprintf(":zap: %d PPS | :electric_plug: %.2f Mbps\nNew Bans: %d, New Sessions: %d", pps, mbps, newBans, newSessions),
 					"UDP Flood", targetPort)
 				ddosAttackActive = true
 			}
@@ -476,8 +485,13 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 			}
 		}
 		ddosMutex.Unlock()
+
+		// Optional: log the measured metrics for debugging.
+		log.Printf("[DDoS Monitor] PPS: %d, Mbps: %.2f, New Bans: %d, New Sessions: %d, AttackActive: %v",
+			pps, mbps, newBans, newSessions, ddosAttackActive)
 	}
 }
+
 
 // ------------------------
 // Main Function
