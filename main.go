@@ -23,6 +23,9 @@ import (
 // Set this to true to disable Discord notifications (for now).
 const disableDiscord = true
 
+// Added flag to disable UDP handshake check.
+const disableUDPHandshakeCheck = true
+
 // discordEmbed defines the structure of a Discord embed.
 type discordEmbed struct {
 	Title       string `json:"title,omitempty"`
@@ -251,7 +254,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 }
 
 // ------------------------
-// UDP Proxy Logic (Persistent Sessions with Modified Handshake Check)
+// UDP Proxy Logic (Persistent Sessions with Handshake Check)
 // ------------------------
 
 type sessionData struct {
@@ -328,13 +331,24 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// Modified handshake check:
-		// Instead of banning when the handshake does not match,
-		// we simply whitelist the IP and mark handshake as checked.
+		// If handshake check is not disabled, then perform handshake check for new IP.
 		if !isWhitelisted(clientIP) && !hasCheckedHandshake(clientIP) {
-			log.Printf(">> [UDP] [%s] No handshake check performed, whitelisting", clientIP)
+			if !disableUDPHandshakeCheck {
+				if !isFiveMHandshake(buf[:n]) {
+					log.Printf(">> [UDP] [%s] Dropped - invalid handshake, banning IP", clientIP)
+					banIP(clientIP)
+					continue
+				}
+			}
+			// Either handshake check is disabled or it passed.
+			log.Printf(">> [UDP] [%s] Authenticated handshake (or bypassed) => whitelisted", clientIP)
 			updateWhitelist(clientIP)
 			markHandshakeChecked(clientIP)
+		} else if !isWhitelisted(clientIP) {
+			// If we've already checked handshake but not whitelisted, ban (unlikely case)
+			log.Printf(">> [UDP] [%s] No handshake pass => ban", clientIP)
+			banIP(clientIP)
+			continue
 		}
 
 		// Normal flow: IP is whitelisted.
@@ -514,7 +528,7 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy in a sepaate goroutine.
+	// Start UDP proxy in a separate goroutine.
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
 	// Start DDoS monitoring in its own goroutine.
