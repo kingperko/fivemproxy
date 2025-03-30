@@ -194,7 +194,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Minimal handshake check for new IP
+	// Minimal handshake check for new IP.
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
@@ -205,14 +205,14 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Must pass either the TLS handshake check or known FiveM patterns
+	// Must pass either the TLS handshake check or known FiveM patterns.
 	if !isTCPHandshake(buf[:n]) && !isFiveMHandshake(buf[:n]) {
 		log.Printf(">> [TCP] [%s] Dropped - Invalid handshake", clientIP)
 		banIP(clientIP)
 		return
 	}
 
-	// Good handshake => whitelist
+	// Good handshake => whitelist.
 	updateWhitelist(clientIP)
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf(">> [TCP] [%s] Authenticated and whitelisted", clientIP)
@@ -222,9 +222,14 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientIP, err)
 		return
 	}
+	// Enable TCP keepalive on backend connection.
+	if tcpConn, ok := backendConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 	defer backendConn.Close()
 
-	// Forward the handshake data
+	// Forward the handshake data.
 	backendConn.Write(buf[:n])
 	proxyTCPWithConn(conn, backendConn, clientIP)
 }
@@ -235,12 +240,23 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 		log.Printf(">> [TCP] Backend dial error: %v", err)
 		return
 	}
+	// Enable TCP keepalive on backend connection.
+	if tcpConn, ok := backendConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 	defer backendConn.Close()
 	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
 }
 
-// Updated function: Waits for both directions to finish and uses CloseWrite for graceful shutdown.
+// Updated function: Uses keepalive and waits for both directions without prematurely closing idle connections.
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
+	// Enable TCP keepalive on client connection if possible.
+	if tcpConn, ok := client.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -251,12 +267,8 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 		if err != nil {
 			log.Printf(">> [TCP] Error copying from client to backend: %v", err)
 		}
-		// Gracefully close the write side of the backend connection.
-		if tcpConn, ok := backend.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
-		} else {
-			backend.Close()
-		}
+		// When the client stops sending, close the backend connection.
+		backend.Close()
 	}()
 
 	// Copy from backend to client.
@@ -266,12 +278,8 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 		if err != nil {
 			log.Printf(">> [TCP] Error copying from backend to client: %v", err)
 		}
-		// Gracefully close the write side of the client connection.
-		if tcpConn, ok := client.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
-		} else {
-			client.Close()
-		}
+		// When the backend stops sending, close the client connection.
+		client.Close()
 	}()
 
 	wg.Wait()
@@ -283,18 +291,18 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 // ------------------------
 
 type sessionData struct {
-	clientAddr  *net.UDPAddr // Client address
-	backendConn *net.UDPConn // Persistent connection to backend for this client
-	lastActive  time.Time    // Last time this session was used
-	closeOnce   sync.Once    // Ensures cleanup is done only once
+	clientAddr  *net.UDPAddr // Client address.
+	backendConn *net.UDPConn // Persistent connection to backend for this client.
+	lastActive  time.Time    // Last time this session was used.
+	closeOnce   sync.Once    // Ensures cleanup is done only once.
 }
 
 var (
-	sessionMap   = make(map[string]*sessionData)
-	sessionMu    sync.Mutex
+	sessionMap = make(map[string]*sessionData)
+	sessionMu  sync.Mutex
 	// The cleanupTimer and sessionTTL are now unused because we are not dropping idle sessions.
-	cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions (unused)
-	sessionTTL   = 600 * time.Second // Idle timeout duration (unused)
+	// cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions (unused)
+	// sessionTTL   = 600 * time.Second // Idle timeout duration (unused)
 )
 
 // For UDP handshake tracking.
@@ -333,8 +341,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 
 	// Start DDoS monitoring.
 	go monitorDDoS(discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", targetIP, listenPort), targetPort)
-	// Removed idle session cleanup to keep sessions alive indefinitely.
-	// go cleanupSessions()
+	// Idle session cleanup is disabled to keep sessions alive indefinitely.
 
 	buf := make([]byte, 2048)
 	for {
@@ -372,7 +379,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			updateWhitelist(clientIP)
 			markHandshakeChecked(clientIP)
 		} else if !isWhitelisted(clientIP) {
-			// If we've already checked handshake but not whitelisted, ban (unlikely case)
+			// If we've already checked handshake but not whitelisted, ban (unlikely case).
 			log.Printf(">> [UDP] [%s] No handshake pass => ban", clientIP)
 			banIP(clientIP)
 			continue
@@ -396,7 +403,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			sessionMap[clientAddr.String()] = sd
 			go handleUDPSession(listenConn, sd)
 		} else {
-			// Update lastActive timestamp, although we won't close idle sessions.
+			// Update lastActive timestamp (even though we no longer drop idle sessions).
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
@@ -431,7 +438,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 			log.Printf(">> [UDP] Error writing to client %s: %v", sd.clientAddr, err)
 		}
 	}
-	// Do not clean up session automatically on error; connection remains until the client really leaves.
+	// Do not automatically clean up session on error; keep connection alive until the client truly disconnects.
 }
 
 // ------------------------
@@ -440,7 +447,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 
 // cleanupSessions is now a no-op so that idle UDP sessions remain alive indefinitely.
 func cleanupSessions() {
-	// Idle cleanup disabled: do nothing.
+	// Idle cleanup disabled.
 }
 
 // ------------------------
@@ -486,7 +493,7 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 		} else {
 			if ddosAttackActive {
 				belowCount++
-				if belowCount >= 2 { // 20 seconds below threshold
+				if belowCount >= 2 { // 20 seconds below threshold.
 					sendDDoSAttackEnded(discordWebhook, serverName, serverIP,
 						fmt.Sprintf(":zap: %d PPS | :electric_plug: %.2f Mbps", peakPPS, peakMbps),
 						"Unique IPs: TBD, Banned IPs: TBD", "UDP Flood", targetPort)
