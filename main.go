@@ -77,7 +77,7 @@ var (
 	whitelistedIPs   = make(map[string]bool)
 	whitelistedIPsMu sync.RWMutex
 
-	// Banned IPs (suspicious/dubious handshake attempts) are blocked immediately.
+	// Banned IPs (suspicious connections) are blocked immediately.
 	bannedIPs   = make(map[string]bool)
 	bannedIPsMu sync.RWMutex
 
@@ -99,14 +99,6 @@ func isWhitelisted(ip string) bool {
 	return whitelistedIPs[ip]
 }
 
-// isLegitHandshake performs a basic check to see if the data contains a known handshake.
-func isLegitHandshake(data string) bool {
-	lower := strings.ToLower(data)
-	return strings.Contains(lower, "get /info.json") ||
-		strings.Contains(lower, "get /players.json") ||
-		strings.Contains(lower, "post /client")
-}
-
 // banIP adds an IP to the banned list.
 func banIP(ip string) {
 	bannedIPsMu.Lock()
@@ -115,15 +107,34 @@ func banIP(ip string) {
 }
 
 // ------------------------
+// Handshake Detection
+// ------------------------
+
+// isLegitHandshake now accepts raw bytes and returns true if the data indicates a
+// TLS handshake (common for FiveM) or contains known plaintext keywords.
+func isLegitHandshake(data []byte) bool {
+	// Check for TLS handshake: record type 0x16 with version 0x03 and version byte 0x00-0x03.
+	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x00 && data[2] <= 0x03) {
+		return true
+	}
+	lower := strings.ToLower(string(data))
+	if strings.Contains(lower, "get /info.json") ||
+		strings.Contains(lower, "get /players.json") ||
+		strings.Contains(lower, "post /client") {
+		return true
+	}
+	return false
+}
+
+// ------------------------
 // TCP Proxy Logic
 // ------------------------
 
-// handleTCPConnection processes each new TCP connection.
 func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook string) {
 	defer conn.Close()
 	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 
-	// If already banned, drop immediately.
+	// Immediately drop if IP is banned.
 	bannedIPsMu.RLock()
 	if bannedIPs[clientIP] {
 		bannedIPsMu.RUnlock()
@@ -132,7 +143,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	bannedIPsMu.RUnlock()
 
-	// If already whitelisted, simply proxy the connection.
+	// If already whitelisted, just proxy.
 	if isWhitelisted(clientIP) {
 		log.Printf(">> [TCP] [%s] Whitelisted - connection allowed", clientIP)
 		proxyTCP(conn, targetIP, targetPort)
@@ -147,23 +158,22 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	if err != nil || n == 0 {
 		log.Printf(">> [TCP] [%s] Error reading handshake: %v", clientIP, err)
 		banIP(clientIP)
-		sendDiscordEmbed(discordWebhook, "Suspicious TCP Connection", fmt.Sprintf("No or invalid handshake from %s", clientIP), 0xff0000)
+		sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious TCP handshake detected. Connection dropped.", 0xff0000)
 		return
 	}
 
-	handshake := string(buf[:n])
-	if !isLegitHandshake(handshake) {
-		log.Printf(">> [TCP] [%s] Dropped - Invalid handshake: %q", clientIP, handshake[:min(n, 64)])
+	// Check handshake validity.
+	if !isLegitHandshake(buf[:n]) {
+		log.Printf(">> [TCP] [%s] Dropped - Invalid handshake", clientIP)
 		banIP(clientIP)
-		sendDiscordEmbed(discordWebhook, "Suspicious TCP Connection", fmt.Sprintf("Invalid handshake from %s", clientIP), 0xff0000)
+		sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious TCP handshake detected. Connection dropped.", 0xff0000)
 		return
 	}
 
-	// Legitimate connection: add to whitelist and proxy.
+	// Valid handshake: whitelist and proxy.
 	updateWhitelist(clientIP)
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf(">> [TCP] [%s] Authenticated and whitelisted", clientIP)
-	// Forward the handshake to the backend.
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientIP, err)
@@ -171,13 +181,12 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	defer backendConn.Close()
 
-	// Send the initial handshake data.
+	// Forward the handshake to the backend.
 	backendConn.Write(buf[:n])
-
 	proxyTCPWithConn(conn, backendConn, clientIP)
 }
 
-// proxyTCP creates a connection to the backend and pipes data between client and backend.
+// proxyTCP establishes a backend connection and pipes data.
 func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -188,7 +197,7 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
 }
 
-// proxyTCPWithConn links two connections together.
+// proxyTCPWithConn pipes data between two connections.
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	done := make(chan struct{}, 2)
 	go func() {
@@ -207,7 +216,6 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 // UDP Proxy Logic
 // ------------------------
 
-// startUDPProxy listens for UDP packets and proxies only if the packet contains a valid handshake.
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
@@ -234,7 +242,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		clientIP := clientAddr.IP.String()
 
-		// Drop if banned.
+		// Drop packet if IP is banned.
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
@@ -243,14 +251,13 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// If not whitelisted, check for handshake keywords.
-		if !isWhitelisted(clientIP) && !isLegitHandshake(string(buf[:n])) {
-			log.Printf(">> [UDP] Dropped packet from %s - no valid handshake", clientIP)
+		// Validate handshake.
+		if !isWhitelisted(clientIP) && !isLegitHandshake(buf[:n]) {
+			log.Printf(">> [UDP] Dropped packet from %s - invalid handshake", clientIP)
 			banIP(clientIP)
-			sendDiscordEmbed(discordWebhook, "Suspicious UDP Packet", fmt.Sprintf("Dropped packet from %s", clientIP), 0xff0000)
+			sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious UDP packet detected. Connection dropped.", 0xff0000)
 			continue
 		}
-		// For a valid UDP handshake, whitelist the IP.
 		if !isWhitelisted(clientIP) {
 			updateWhitelist(clientIP)
 			log.Printf(">> [UDP] [%s] Whitelisted via UDP handshake", clientIP)
@@ -268,7 +275,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			backendConn.Close()
 			continue
 		}
-		// Read backend response.
 		respBuf := make([]byte, 2048)
 		backendConn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		n2, err := backendConn.Read(respBuf)
@@ -277,7 +283,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			log.Printf(">> [UDP] Read from backend error: %v", err)
 			continue
 		}
-		// Send the response back to the client.
 		_, err = conn.WriteToUDP(respBuf[:n2], clientAddr)
 		if err != nil {
 			log.Printf(">> [UDP] Write to client error: %v", err)
@@ -286,7 +291,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 }
 
 // ------------------------
-// Utility
+// Utility Functions
 // ------------------------
 
 func min(a, b int) int {
