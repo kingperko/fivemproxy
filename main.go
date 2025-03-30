@@ -79,7 +79,7 @@ func sendDDoSAttackStarted(webhookURL, serverName, serverIP, currentMetrics, att
 		"**Current Metrics**\n" + currentMetrics + "\n" +
 		"**Attack Method**\n" + attackMethod + "\n" +
 		"**Target Port**\n" + targetPort
-	// Red color (0xff0000) for attack started.
+	// Red color for attack started.
 	sendDiscordEmbed(webhookURL, title, description, 0xff0000)
 }
 
@@ -93,7 +93,7 @@ func sendDDoSAttackEnded(webhookURL, serverName, serverIP, peakMetrics, firewall
 		"**Firewall Stats**\n" + firewallStats + "\n" +
 		"**Attack Method**\n" + attackMethod + "\n" +
 		"**Target Port**\n" + targetPort
-	// Green color (0x00ff00) for attack ended.
+	// Green color for attack ended.
 	sendDiscordEmbed(webhookURL, title, description, 0x00ff00)
 }
 
@@ -134,6 +134,7 @@ func banIP(ip string) {
 // ------------------------
 
 func isLegitHandshake(data []byte) bool {
+	// Check for TLS handshake: record type 0x16 with version 0x03.
 	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 &&
 		(data[2] >= 0x00 && data[2] <= 0x03) {
 		return true
@@ -227,7 +228,6 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 // UDP Proxy Logic (Persistent Sessions)
 // ------------------------
 
-// sessionData holds the information for a persistent UDP session.
 type sessionData struct {
 	clientAddr  *net.UDPAddr // Client address
 	backendConn *net.UDPConn // Persistent connection to backend for this client
@@ -236,13 +236,22 @@ type sessionData struct {
 }
 
 var (
-	// Increased sessionTTL to 600 seconds (10 minutes) to prevent premature cleanup.
+	// Set sessionTTL to 600 seconds (10 minutes) to keep legitimate sessions active.
 	sessionMap   = make(map[string]*sessionData)
 	sessionMu    sync.Mutex
 	cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions
 	sessionTTL   = 600 * time.Second // Idle timeout duration (10 minutes)
 )
 
+// Global counters for DDoS detection.
+var (
+	ddosPacketCount uint64
+	ddosByteCount   uint64
+	ddosAttackActive bool
+	ddosMutex        sync.Mutex
+)
+
+// startUDPProxy creates a UDP listener and handles sessions.
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	listenAddr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
@@ -259,6 +268,10 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		log.Fatalf(">> [UDP] Error resolving backend address: %v", err)
 	}
 
+	// Start DDoS monitoring.
+	go monitorDDoS(discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", targetIP, listenPort), targetPort)
+
+	// Start session cleanup.
 	go cleanupSessions()
 
 	buf := make([]byte, 2048)
@@ -268,6 +281,11 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			log.Printf(">> [UDP] Read error: %v", err)
 			continue
 		}
+
+		// Update global DDoS counters.
+		atomic.AddUint64(&ddosPacketCount, 1)
+		atomic.AddUint64(&ddosByteCount, uint64(n))
+
 		clientIP := clientAddr.IP.String()
 
 		bannedIPsMu.RLock()
@@ -282,16 +300,16 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		if !isWhitelisted(clientIP) && !isLegitHandshake(buf[:n]) {
 			log.Printf(">> [UDP] Dropped packet from %s - invalid handshake", clientIP)
 			banIP(clientIP)
-			sendDiscordEmbed(discordWebhook, "Proxy Alert", "Suspicious UDP packet detected. Connection dropped.", 0xff0000)
+			// (No Discord alert here; alerts come only from DDoS monitor.)
 			continue
 		}
-		// If not whitelisted, update whitelist.
+		// Whitelist if not already.
 		if !isWhitelisted(clientIP) {
 			updateWhitelist(clientIP)
 			log.Printf(">> [UDP] [%s] Whitelisted via UDP handshake", clientIP)
 		}
 
-		// Update or create session.
+		// Update or create persistent session.
 		sessionMu.Lock()
 		sd, exists := sessionMap[clientAddr.String()]
 		if !exists {
@@ -309,12 +327,10 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			sessionMap[clientAddr.String()] = sd
 			go handleUDPSession(listenConn, sd)
 		} else {
-			// Update lastActive on each packet from an existing session.
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
 
-		// Forward the packet to the backend.
 		_, err = sd.backendConn.Write(buf[:n])
 		if err != nil {
 			log.Printf(">> [UDP] Write to backend error for client %s: %v", clientIP, err)
@@ -323,6 +339,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 }
 
+// handleUDPSession continuously reads from a session’s backend connection and forwards data to the client.
 func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 	buf := make([]byte, 2048)
 	for {
@@ -330,13 +347,12 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 		n, err := sd.backendConn.Read(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				// If a timeout occurs, continue to wait for backend responses.
 				continue
 			}
 			log.Printf(">> [UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
 			break
 		}
-		// Update lastActive on receiving any backend data.
+		// Update lastActive when backend responds.
 		sessionMu.Lock()
 		sd.lastActive = time.Now()
 		sessionMu.Unlock()
@@ -349,6 +365,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 	cleanupSession(sd.clientAddr.String())
 }
 
+// cleanupSessions periodically removes sessions that have been idle too long.
 func cleanupSessions() {
 	ticker := time.NewTicker(cleanupTimer)
 	defer ticker.Stop()
@@ -365,6 +382,7 @@ func cleanupSessions() {
 	}
 }
 
+// cleanupSession closes and removes a session.
 func cleanupSession(key string) {
 	sessionMu.Lock()
 	sd, exists := sessionMap[key]
@@ -376,6 +394,75 @@ func cleanupSession(key string) {
 	}
 	sessionMu.Unlock()
 }
+
+// ------------------------
+// DDoS Detection Logic
+// ------------------------
+
+func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	var peakPPS uint64
+	var peakMbps float64
+	var belowCount int
+
+	// Set thresholds (adjust these as needed).
+	const ppsThreshold = 1000  // packets per second threshold
+	const mbpsThreshold = 1.0  // Mbps threshold
+
+	for range ticker.C {
+		// Calculate averages over the 10-second interval.
+		pps := atomic.LoadUint64(&ddosPacketCount) / 10
+		bytesCount := atomic.LoadUint64(&ddosByteCount)
+		mbps := (float64(bytesCount)*8/1e6)/10
+
+		// Update peak metrics.
+		if pps > peakPPS {
+			peakPPS = pps
+		}
+		if mbps > peakMbps {
+			peakMbps = mbps
+		}
+
+		// Reset counters.
+		atomic.StoreUint64(&ddosPacketCount, 0)
+		atomic.StoreUint64(&ddosByteCount, 0)
+
+		ddosMutex.Lock()
+		if pps > ppsThreshold || mbps > mbpsThreshold {
+			if !ddosAttackActive {
+				// Attack started.
+				sendDDoSAttackStarted(discordWebhook, serverName, serverIP,
+					fmt.Sprintf(":zap: %d PPS | :electric_plug: %.2f Mbps", pps, mbps),
+					"UDP Flood", targetPort)
+				ddosAttackActive = true
+			}
+			belowCount = 0
+		} else {
+			if ddosAttackActive {
+				belowCount++
+				if belowCount >= 2 { // 20 seconds below threshold
+					sendDDoSAttackEnded(discordWebhook, serverName, serverIP,
+						fmt.Sprintf(":zap: %d PPS | :electric_plug: %.2f Mbps", peakPPS, peakMbps),
+						"Unique IPs: TBD, Banned IPs: TBD", "UDP Flood", targetPort)
+					ddosAttackActive = false
+					peakPPS = 0
+					peakMbps = 0
+					belowCount = 0
+				}
+			}
+		}
+		ddosMutex.Unlock()
+	}
+}
+
+var (
+	ddosPacketCount  uint64
+	ddosByteCount    uint64
+	ddosAttackActive bool
+	ddosMutex        sync.Mutex
+)
 
 // ------------------------
 // Utility Functions
@@ -425,5 +512,12 @@ func main() {
 	}()
 
 	// Start UDP proxy (runs in main goroutine).
-	startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
+	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
+
+	// Start DDoS monitoring.
+	// Here, "serverName" is fixed as "FiveGate" and the server IP:port is taken from targetIP and listenPort.
+	go monitorDDoS(*discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", *targetIP, *listenPort), *targetPort)
+
+	// Block forever.
+	select {}
 }
