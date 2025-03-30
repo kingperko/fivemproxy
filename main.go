@@ -214,35 +214,66 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 }
 
 // ------------------------
-// UDP Proxy Logic
+// NAT-based UDP Proxy Logic
 // ------------------------
 
+// sessionData holds info about each client -> backend session
+type sessionData struct {
+	clientAddr  *net.UDPAddr // the original client
+	lastActive  time.Time    // last time we saw traffic
+}
+
+// We keep a single backendConn for all traffic to the backend
+// and a map of client -> sessionData
+var (
+	sessionMap   = make(map[string]*sessionData)
+	sessionMu    sync.Mutex
+	cleanupTimer = 30 * time.Second  // how often we remove stale sessions
+	sessionTTL   = 120 * time.Second // how long to keep an inactive session
+)
+
+// startUDPProxy sets up a single UDP connection to the backend and
+// spawns goroutines to handle both inbound (client->proxy) and
+// outbound (backend->proxy) traffic.
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
-	addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
+	// 1) Listen for client traffic on listenPort
+	listenAddr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
 		log.Fatalf(">> [UDP] Error resolving listen address: %v", err)
 	}
-	conn, err := net.ListenUDP("udp", addr)
+	listenConn, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
 		log.Fatalf(">> [UDP] Error starting UDP listener on port %s: %v", listenPort, err)
 	}
-	defer conn.Close()
 	log.Printf(">> [UDP] Listening on port %s", listenPort)
 
+	// 2) Dial the backend (single socket)
 	backendAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Fatalf(">> [UDP] Error resolving backend address: %v", err)
 	}
+	backendConn, err := net.DialUDP("udp", nil, backendAddr)
+	if err != nil {
+		log.Fatalf(">> [UDP] Error dialing backend: %v", err)
+	}
+	log.Printf(">> [UDP] Connected to backend %s:%s", targetIP, targetPort)
 
+	// 3) Start a goroutine to read from the backend and forward to clients
+	go handleBackendResponses(listenConn, backendConn)
+
+	// 4) Start a cleanup goroutine to remove stale sessions
+	go cleanupSessions()
+
+	// 5) Main loop: read from the client, forward to the backend
 	buf := make([]byte, 2048)
 	for {
-		n, clientAddr, err := conn.ReadFromUDP(buf)
+		n, clientAddr, err := listenConn.ReadFromUDP(buf)
 		if err != nil {
 			log.Printf(">> [UDP] Read error: %v", err)
 			continue
 		}
-		clientIP := clientAddr.IP.String()
 
+		clientIP := clientAddr.IP.String()
 		// Drop packet if IP is banned.
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
@@ -258,38 +289,85 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			continue
 		}
 
-		// Forward packet to backend.
-		backendConn, err := net.DialUDP("udp", nil, backendAddr)
-		if err != nil {
-			log.Printf(">> [UDP] Backend dial error: %v", err)
-			continue
+		// Update or create session data
+		sessionMu.Lock()
+		sd, exists := sessionMap[clientAddr.String()]
+		if !exists {
+			sd = &sessionData{clientAddr: clientAddr, lastActive: time.Now()}
+			sessionMap[clientAddr.String()] = sd
+		} else {
+			sd.lastActive = time.Now()
 		}
+		sessionMu.Unlock()
+
+		// Forward packet to the backend
 		_, err = backendConn.Write(buf[:n])
 		if err != nil {
 			log.Printf(">> [UDP] Write to backend error: %v", err)
-			backendConn.Close()
 			continue
 		}
+	}
+}
 
-		// Attempt to read response from backend with an increased timeout.
-		respBuf := make([]byte, 2048)
-		backendConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		n2, err := backendConn.Read(respBuf)
-		backendConn.Close()
+// handleBackendResponses reads packets from the backendConn and forwards them
+// to the correct client based on sessionMap.
+func handleBackendResponses(listenConn, backendConn *net.UDPConn) {
+	buf := make([]byte, 2048)
+	for {
+		backendConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, _, err := backendConn.ReadFromUDP(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				log.Printf(">> [UDP] Read from backend timeout, no response received")
-			} else {
-				log.Printf(">> [UDP] Read from backend error: %v", err)
+				// This is normal if there's no traffic, just continue
+				continue
 			}
+			log.Printf(">> [UDP] Error reading from backend: %v", err)
 			continue
 		}
 
-		// Send response back to client.
-		_, err = conn.WriteToUDP(respBuf[:n2], clientAddr)
-		if err != nil {
-			log.Printf(">> [UDP] Write to client error: %v", err)
+		// In a NAT scenario, the backend doesn't know the original client's address.
+		// Typically, for many game servers, the response is "matched" to the correct
+		// client by content or the server only expects a single client. If your
+		// backend includes some info to identify the client, you'd parse it here.
+
+		// For FiveM or typical game servers, each client has their own "conversation"
+		// with the server. But all server responses come back to the same local port.
+		// If your server sends back multiple responses for multiple clients, you
+		// need a more advanced matching technique (like reading embedded IDs).
+		//
+		// If your server is effectively only talking to one client at a time, or
+		// doesn't need multiple simultaneous connections, you can simply forward
+		// all responses to the last active client. For multi-client scenarios,
+		// there's no perfect solution without additional logic or data in the packet.
+
+		// --- Simple approach: forward to every active client (not ideal for large servers).
+		// This is a fallback if the server doesn't embed any info to identify the client.
+		sessionMu.Lock()
+		for _, sd := range sessionMap {
+			// As a naive approach, forward to all active clients:
+			_, werr := listenConn.WriteToUDP(buf[:n], sd.clientAddr)
+			if werr != nil {
+				log.Printf(">> [UDP] Write to client %s error: %v", sd.clientAddr, werr)
+			}
 		}
+		sessionMu.Unlock()
+	}
+}
+
+// cleanupSessions periodically removes stale sessions that haven't had traffic.
+func cleanupSessions() {
+	ticker := time.NewTicker(cleanupTimer)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+		now := time.Now()
+		sessionMu.Lock()
+		for key, sd := range sessionMap {
+			if now.Sub(sd.lastActive) > sessionTTL {
+				delete(sessionMap, key)
+			}
+		}
+		sessionMu.Unlock()
 	}
 }
 
