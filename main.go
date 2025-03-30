@@ -128,6 +128,17 @@ func banIP(ip string) {
 }
 
 // ------------------------
+// DDoS Global Variables
+// ------------------------
+
+var (
+	ddosMutex        sync.Mutex
+	ddosPacketCount  uint64
+	ddosByteCount    uint64
+	ddosAttackActive bool
+)
+
+// ------------------------
 // Handshake Detection
 // ------------------------
 
@@ -238,14 +249,6 @@ var (
 	sessionMu    sync.Mutex
 	cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions
 	sessionTTL   = 600 * time.Second // Idle timeout duration (10 minutes)
-)
-
-// Global counters for DDoS detection.
-var (
-	ddosPacketCount  uint64
-	ddosByteCount    uint64
-	ddosAttackActive bool
-	ddosMutex        sync.Mutex
 )
 
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
@@ -444,18 +447,6 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 		ddosMutex.Unlock()
 	}
 }
-
-// ------------------------
-// Global DDoS Variables
-// ------------------------
-
-var (
-	ddosMutex        sync.Mutex
-	// These variables are updated in the UDP loop.
-	ddosPacketCount  uint64
-	ddosByteCount    uint64
-	ddosAttackActive bool
-)
 
 // ------------------------
 // Utility Functions
