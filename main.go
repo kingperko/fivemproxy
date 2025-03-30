@@ -77,21 +77,33 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 }
 
 // ------------------------
-// Constants for advanced DDoS detection
+// Proxy & DDoS detection globals
 // ------------------------
 
-const (
-	IntervalDuration   = 10 * time.Second
-	OverallThreshold   int64 = 150  // overall events in an interval to trigger attack mode (if >1 unique IP)
-	SingleIPThreshold  int64 = 400  // threshold for single-client scenario
-	RelativeThreshold        = 0.8  // if an IP produces >80% of events in multi-IP scenario, it's suspicious
-	DiscordGraphFactor int64 = 10   // divisor to scale the bar graph (adjust as needed)
+var (
+	// Global counters for TCP and UDP events (per interval)
+	tcpConnCount   int64
+	udpPacketCount int64
+
+	// ipEventCounts collects per-IP event counts during the interval.
+	ipEventCounts   = make(map[string]int64)
+	ipEventCountsMu sync.Mutex
+
+	// bannedIPs: IPs that have been banned.
+	bannedIPs   = make(map[string]bool)
+	bannedIPsMu sync.RWMutex
+
+	// activeTCP tracks IPs with active TCP connections.
+	activeTCP   = make(map[string]bool)
+	activeTCPMu sync.RWMutex
+
+	// Overall attack mode flag.
+	attackMode      bool
+	attackModeMu    sync.Mutex
+	lastInterval    IntervalStats
 )
 
-// ------------------------
-// Data structures for interval stats
-// ------------------------
-
+// IntervalStats aggregates stats over a fixed interval.
 type IntervalStats struct {
 	TotalTCP  int64
 	TotalUDP  int64
@@ -99,126 +111,138 @@ type IntervalStats struct {
 	StartTime time.Time
 }
 
-var (
-	statsMutex   sync.Mutex
-	currentStats = IntervalStats{IPCounts: make(map[string]int64), StartTime: time.Now()}
+// We'll use a sliding window interval.
+const IntervalDuration = 10 * time.Second
+
+// Detection thresholds.
+const (
+	OverallThreshold  int64   = 150  // overall events in an interval to trigger attack mode (if >1 unique IP)
+	BaselineFactor    float64 = 2.0  // only add score if an IP's events exceed (average * BaselineFactor)
+	ScoreThreshold    float64 = 50.0 // cumulative score above which the IP is banned
+	DecayFactor       float64 = 0.8  // score decays each interval by this factor
+	RelativeThreshold float64 = 0.8  // if one IP exceeds 80% of total events, it's suspect
 )
 
-// updateStats updates the current stats for a given IP and protocol.
-func updateStats(ip string, protocol string) {
-	statsMutex.Lock()
-	defer statsMutex.Unlock()
-	if protocol == "tcp" {
-		currentStats.TotalTCP++
-	} else if protocol == "udp" {
-		currentStats.TotalUDP++
+// ipScores stores a cumulative score for each IP.
+var (
+	ipScores   = make(map[string]float64)
+	ipScoresMu sync.Mutex
+)
+
+// updateIntervalStats aggregates current interval stats.
+func updateIntervalStats() IntervalStats {
+	ipEventCountsMu.Lock()
+	defer ipEventCountsMu.Unlock()
+	return IntervalStats{
+		TotalTCP:  atomic.LoadInt64(&tcpConnCount),
+		TotalUDP:  atomic.LoadInt64(&udpPacketCount),
+		IPCounts:  copyMap(ipEventCounts),
+		StartTime: time.Now(),
 	}
-	currentStats.IPCounts[ip]++
 }
 
-// resetStats resets the interval stats and returns the previous stats.
-func resetStats() IntervalStats {
-	statsMutex.Lock()
-	defer statsMutex.Unlock()
-	prev := currentStats
-	currentStats = IntervalStats{IPCounts: make(map[string]int64), StartTime: time.Now()}
-	return prev
-}
-
-// generateBar returns a simple text bar for a given value.
-func generateBar(value int64, max int64) string {
-	// Scale to a maximum of 10 blocks.
-	blocks := int((float64(value) / float64(max)) * 10)
-	if blocks < 1 {
-		blocks = 1
+// copyMap returns a shallow copy of a map.
+func copyMap(src map[string]int64) map[string]int64 {
+	dst := make(map[string]int64)
+	for k, v := range src {
+		dst[k] = v
 	}
-	return strings.Repeat("█", blocks)
+	return dst
 }
 
-// ------------------------
-// Global variables for active TCP tracking and banning
-// ------------------------
-
-var (
-	activeTCP sync.Map // map[string]bool for IPs with active TCP connections
-	bannedIPs sync.Map // map[string]bool for banned IPs
-)
-
-// For overall attack mode.
-var (
-	attackMode      bool
-	attackModeLock  sync.Mutex
-	lastAttackStats IntervalStats
-)
-
-// For per-IP event counting.
-var (
-	ipEventCounts sync.Map // map[string]*int64
-)
-
-// incrementIPEvent increments the counter for a given IP.
-func incrementIPEvent(ip string) {
-	v, _ := ipEventCounts.LoadOrStore(ip, new(int64))
-	atomic.AddInt64(v.(*int64), 1)
+// resetInterval resets the global per-interval counters.
+func resetIntervalStats() {
+	atomic.StoreInt64(&tcpConnCount, 0)
+	atomic.StoreInt64(&udpPacketCount, 0)
+	ipEventCountsMu.Lock()
+	ipEventCounts = make(map[string]int64)
+	ipEventCountsMu.Unlock()
 }
 
-// ------------------------
-// Advanced interval processing and DDoS screening
-// ------------------------
-
-func processIntervalStats(discordWebhook string) {
-	stats := resetStats()
+// processInterval analyzes stats and updates ipScores; bans IPs if their score exceeds threshold.
+func processInterval(discordWebhook string) {
+	stats := updateIntervalStats()
 	total := stats.TotalTCP + stats.TotalUDP
 	uniqueCount := len(stats.IPCounts)
 
-	// Build sorted list of IPs.
-	type ipStat struct {
+	// Calculate baseline average per IP.
+	var avg float64
+	if uniqueCount > 0 {
+		avg = float64(total) / float64(uniqueCount)
+	}
+
+	// Update ipScores for each IP.
+	ipScoresMu.Lock()
+	for ip, count := range stats.IPCounts {
+		// If the count exceeds (avg * BaselineFactor), add the excess to the score.
+		if float64(count) > avg*BaselineFactor {
+			excess := float64(count) - avg*BaselineFactor
+			ipScores[ip] += excess
+		} else {
+			// Otherwise, decay the score.
+			ipScores[ip] *= DecayFactor
+		}
+		// If an IP has an active TCP connection, we can be more lenient:
+		activeTCPMu.RLock()
+		_, active := activeTCP[ip]
+		activeTCPMu.RUnlock()
+		if active && ipScores[ip] < ScoreThreshold/2 {
+			ipScores[ip] = 0 // reset score for active connections
+		}
+		// Ban IP if score exceeds threshold.
+		if ipScores[ip] > ScoreThreshold {
+			bannedIPsMu.Lock()
+			bannedIPs[ip] = true
+			bannedIPsMu.Unlock()
+			log.Printf("BANNED: IP %s banned with score %.2f", ip, ipScores[ip])
+		}
+	}
+	// Build a sorted list of offenders.
+	type ipScore struct {
 		IP    string
+		Score float64
 		Count int64
 	}
-	var statsList []ipStat
+	var offenders []ipScore
 	for ip, count := range stats.IPCounts {
-		statsList = append(statsList, ipStat{IP: ip, Count: count})
+		score := ipScores[ip]
+		offenders = append(offenders, ipScore{IP: ip, Score: score, Count: count})
 	}
-	sort.Slice(statsList, func(i, j int) bool {
-		return statsList[i].Count > statsList[j].Count
+	sort.Slice(offenders, func(i, j int) bool {
+		return offenders[i].Score > offenders[j].Score
 	})
+	ipScoresMu.Unlock()
 
-	// Build a simple textual bar graph for top 3 offenders.
+	// Build a textual bar graph for top 3 offenders.
 	graphLines := ""
-	maxCount := int64(1)
-	if len(statsList) > 0 {
-		maxCount = statsList[0].Count
+	maxScore := 1.0
+	if len(offenders) > 0 {
+		maxScore = offenders[0].Score
 	}
-	for i, s := range statsList {
+	for i, o := range offenders {
 		if i >= 3 {
 			break
 		}
-		bar := generateBar(s.Count, maxCount/DiscordGraphFactor+1)
-		graphLines += fmt.Sprintf("%s: %d events %s\n", s.IP, s.Count, bar)
+		// Scale the bar to 10 blocks.
+		barLen := int((o.Score / maxScore) * 10)
+		if barLen < 1 {
+			barLen = 1
+		}
+		bar := strings.Repeat("█", barLen)
+		graphLines += fmt.Sprintf("%s: %.2f (Count: %d) %s\n", o.IP, o.Score, o.Count, bar)
 	}
 
-	// Log advanced interval summary.
+	// Log summary.
 	log.Printf("=== Advanced Interval Summary ===")
-	log.Printf("Duration: %v", IntervalDuration)
+	log.Printf("Interval Duration: %v", IntervalDuration)
 	log.Printf("TCP: %d | UDP: %d | Total: %d | Unique IPs: %d", stats.TotalTCP, stats.TotalUDP, total, uniqueCount)
 	log.Printf("Top Offenders:\n%s", graphLines)
 
-	// Advanced screening.
-	var banned []string
+	// Advanced attack detection:
+	attackModeMu.Lock()
 	if uniqueCount > 1 && total > OverallThreshold {
-		// If one IP produces more than 80% of the traffic, ban it.
-		for _, s := range statsList {
-			share := float64(s.Count) / float64(total)
-			if share > RelativeThreshold {
-				bannedIPs.Store(s.IP, true)
-				banned = append(banned, fmt.Sprintf("%s (%.0f%%)", s.IP, share*100))
-				log.Printf("BANNED: IP %s banned for excessive share (%.0f%%)", s.IP, share*100)
-			}
-		}
 		if !attackMode {
 			attackMode = true
-			lastAttackStats = stats
 			desc := fmt.Sprintf("DDoS attack detected.\nTotal events: %d\nUnique IPs: %d\n\nTop Offenders:\n%s", total, uniqueCount, graphLines)
 			log.Printf(">>> DDoS attack detected. Mitigation enabled.")
 			sendDiscordEmbed(discordWebhook, "Server Mitigation Enabled", desc, 0xff6600)
@@ -231,6 +255,9 @@ func processIntervalStats(discordWebhook string) {
 			sendDiscordEmbed(discordWebhook, "Attack Ended", desc, 0x00bfff)
 		}
 	}
+	attackModeMu.Unlock()
+
+	resetIntervalStats()
 }
 
 // ------------------------
@@ -242,26 +269,35 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	clientAddr := client.RemoteAddr().String()
 	clientIP := strings.Split(clientAddr, ":")[0]
 
-	// Drop connection if banned.
-	if _, banned := bannedIPs.Load(clientIP); banned {
+	// If banned, drop connection.
+	bannedIPsMu.RLock()
+	if banned, exists := bannedIPs[clientIP]; exists && banned {
+		bannedIPsMu.RUnlock()
 		log.Printf("[TCP] Dropping connection from banned IP %s", clientIP)
 		client.Close()
 		return
 	}
+	bannedIPsMu.RUnlock()
 
 	log.Printf("[TCP] Accepted connection from %s", clientAddr)
-	// Mark IP as active on TCP.
-	activeTCP.Store(clientIP, true)
-	defer activeTCP.Delete(clientIP)
+	activeTCPMu.Lock()
+	activeTCP[clientIP] = true
+	activeTCPMu.Unlock()
+	defer func() {
+		activeTCPMu.Lock()
+		delete(activeTCP, clientIP)
+		activeTCPMu.Unlock()
+	}()
 
-	updateStats(clientIP, "tcp")
-	incrementIPEvent(clientIP)
-
-	defer client.Close()
+	atomic.AddInt64(&tcpConnCount, 1)
+	ipEventCountsMu.Lock()
+	ipEventCounts[clientIP]++
+	ipEventCountsMu.Unlock()
 
 	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf("[TCP] Error connecting to backend for %s: %v", clientAddr, err)
+		client.Close()
 		return
 	}
 	defer backend.Close()
@@ -318,6 +354,10 @@ type udpEntry struct {
 	lastSeen    time.Time
 }
 
+var (
+	ipEventCountsMu sync.Mutex // protects ipEventCounts map
+)
+
 func startUDPProxy(listenPort, targetIP, targetPort string) {
 	addr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
@@ -342,18 +382,24 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 		clientKey := clientAddr.String()
 		clientIP := strings.Split(clientKey, ":")[0]
 		uniqueIPs.Store(clientIP, true)
-		// Only count UDP events if no active TCP from this IP.
-		if _, active := activeTCP.Load(clientIP); !active {
-			updateStats(clientIP, "udp")
-			incrementIPEvent(clientIP)
+		// Only count UDP events if no active TCP exists.
+		activeTCPMu.RLock()
+		_, active := activeTCP[clientIP]
+		activeTCPMu.RUnlock()
+		if !active {
+			ipEventCountsMu.Lock()
+			ipEventCounts[clientIP]++
+			ipEventCountsMu.Unlock()
 		}
-
-		// Drop packet if IP is banned.
-		if _, banned := bannedIPs.Load(clientIP); banned {
+		bannedIPsMu.RLock()
+		if banned, exists := bannedIPs[clientIP]; exists && banned {
+			bannedIPsMu.RUnlock()
 			log.Printf("[UDP] Dropping packet from banned IP %s", clientIP)
 			continue
 		}
+		bannedIPsMu.RUnlock()
 
+		atomic.AddInt64(&udpPacketCount, 1)
 		mu.Lock()
 		entry, found := backendMap[clientKey]
 		if !found {
@@ -413,12 +459,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start advanced interval processing.
+	// Start advanced interval processing every IntervalDuration.
 	go func() {
 		ticker := time.NewTicker(IntervalDuration)
 		defer ticker.Stop()
 		for range ticker.C {
-			processIntervalStats(*discordWebhook)
+			processInterval(*discordWebhook)
 		}
 	}()
 
