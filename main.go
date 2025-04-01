@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,209 +11,146 @@ import (
 	"time"
 )
 
-// ------------------------
-// PROXY Protocol Helper (TCP)
-// ------------------------
+const bufferSize = 65535
+const clientTimeout = 60 * time.Second
 
-// sendProxyHeader writes a PROXY protocol v1 header to the backend connection.
-// Format: "PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n"
-func sendProxyHeader(clientAddr net.Addr, targetIP, targetPort string, backend net.Conn) error {
-	tcpAddr, ok := clientAddr.(*net.TCPAddr)
-	if !ok {
-		return errors.New("client address is not a TCPAddr")
-	}
-	header := fmt.Sprintf("PROXY TCP4 %s %s %d %s\r\n",
-		tcpAddr.IP.String(), targetIP, tcpAddr.Port, targetPort)
-	_, err := backend.Write([]byte(header))
-	return err
+var discordWebhook string
+
+type UDPProxy struct {
+	clientConn  *net.UDPConn
+	serverAddr  *net.UDPAddr
+	connections sync.Map
 }
 
-// ------------------------
-// TCP Proxy Logic
-// ------------------------
+type UDPConnection struct {
+	serverConn *net.UDPConn
+	lastActive time.Time
+}
 
-// handleTCPConnection proxies a TCP client connection to the backend.
-// It sends a PROXY protocol header to preserve the client’s IP.
-func handleTCPConnection(clientConn net.Conn, targetIP, targetPort string) {
-	defer clientConn.Close()
-	clientAddr := clientConn.RemoteAddr().String()
-	log.Printf("[TCP] Client connected: %s", clientAddr)
-
-	// Connect to the backend.
-	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
+func NewUDPProxy(proxyAddrUDP, serverAddr string) (*UDPProxy, error) {
+	clientAddr, err := net.ResolveUDPAddr("udp", proxyAddrUDP)
 	if err != nil {
-		log.Printf("[TCP] Failed to connect to backend %s:%s: %v", targetIP, targetPort, err)
-		return
-	}
-	defer backendConn.Close()
-
-	// Send the PROXY protocol header.
-	if err := sendProxyHeader(clientConn.RemoteAddr(), targetIP, targetPort, backendConn); err != nil {
-		log.Printf("[TCP] Error sending PROXY header for %s: %v", clientAddr, err)
-		return
+		return nil, err
 	}
 
-	// Bidirectional copy.
+	clientConn, err := net.ListenUDP("udp", clientAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	return &UDPProxy{
+		clientConn: clientConn,
+		serverAddr: serverUDPAddr,
+	}, nil
+}
+
+func (p *UDPProxy) handleClient(clientAddr *net.UDPAddr, data []byte) {
+	conn, loaded := p.connections.Load(clientAddr.String())
+	if !loaded {
+		serverConn, err := net.DialUDP("udp", nil, p.serverAddr)
+		if err != nil {
+			log.Printf("UDP dial error: %v\n", err)
+			return
+		}
+
+		newConn := &UDPConnection{
+			serverConn: serverConn,
+			lastActive: time.Now(),
+		}
+
+		p.connections.Store(clientAddr.String(), newConn)
+
+		go p.listenServer(clientAddr, newConn)
+		conn = newConn
+	}
+
+	udpConn := conn.(*UDPConnection)
+	udpConn.lastActive = time.Now()
+	udpConn.serverConn.Write(data)
+}
+
+func (p *UDPProxy) listenServer(clientAddr *net.UDPAddr, conn *UDPConnection) {
+	buf := make([]byte, bufferSize)
+	for {
+		conn.serverConn.SetReadDeadline(time.Now().Add(clientTimeout))
+		n, err := conn.serverConn.Read(buf)
+		if err != nil {
+			p.connections.Delete(clientAddr.String())
+			conn.serverConn.Close()
+			return
+		}
+
+		p.clientConn.WriteToUDP(buf[:n], clientAddr)
+	}
+}
+
+func (p *UDPProxy) Start() {
+	log.Printf("[UDP] Proxy listening on %s\n", p.clientConn.LocalAddr().String())
+	buffer := make([]byte, bufferSize)
+	for {
+		n, clientAddr, err := p.clientConn.ReadFromUDP(buffer)
+		if err != nil {
+			log.Printf("Client UDP read error: %v\n", err)
+			continue
+		}
+		go p.handleClient(clientAddr, buffer[:n])
+	}
+}
+
+func handleTCPConnection(client net.Conn, serverAddr string) {
+	defer client.Close()
+
+	server, err := net.Dial("tcp", serverAddr)
+	if err != nil {
+		log.Printf("TCP dial error: %v\n", err)
+		return
+	}
+	defer server.Close()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(backendConn, clientConn)
-		backendConn.Close()
+		io.Copy(server, client)
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, backendConn)
-		clientConn.Close()
+		io.Copy(client, server)
 	}()
 
 	wg.Wait()
-	log.Printf("[TCP] Connection closed: %s", clientAddr)
 }
 
-// startTCPListener starts a TCP listener on the specified port and forwards
-// connections to the backend.
-func startTCPListener(listenPort, targetIP, targetPort string) {
-	ln, err := net.Listen("tcp", ":"+listenPort)
+func startTCPProxy(proxyAddrTCP, serverAddr string) {
+	listener, err := net.Listen("tcp", proxyAddrTCP)
 	if err != nil {
-		log.Fatalf("[TCP] Failed to listen on port %s: %v", listenPort, err)
+		log.Fatalf("TCP Listen error: %v", err)
 	}
-	defer ln.Close()
-	log.Printf("[TCP] Listening on port %s -> %s:%s", listenPort, targetIP, targetPort)
+	defer listener.Close()
 
+	log.Printf("[TCP] Proxy listening on %s\n", proxyAddrTCP)
 	for {
-		conn, err := ln.Accept()
+		client, err := listener.Accept()
 		if err != nil {
-			log.Printf("[TCP] Accept error: %v", err)
+			log.Printf("TCP accept error: %v\n", err)
 			continue
 		}
-		go handleTCPConnection(conn, targetIP, targetPort)
+		go handleTCPConnection(client, serverAddr)
 	}
 }
-
-// ------------------------
-// UDP Proxy Logic
-// ------------------------
-
-// For UDP, a persistent session is maintained per client.
-type udpSession struct {
-	clientAddr  *net.UDPAddr
-	backendConn *net.UDPConn
-	lastActive  time.Time
-}
-
-var (
-	sessionMap = make(map[string]*udpSession)
-	sessionMu  sync.Mutex
-)
-
-// handleUDPSession reads from the backend and forwards data to the client.
-func handleUDPSession(listenConn *net.UDPConn, sess *udpSession, clientKey string) {
-	buf := make([]byte, 65535)
-	idleTimeout := 60 * time.Second
-
-	for {
-		sess.backendConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		n, err := sess.backendConn.Read(buf)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				sessionMu.Lock()
-				if time.Since(sess.lastActive) > idleTimeout {
-					delete(sessionMap, clientKey)
-					sessionMu.Unlock()
-					log.Printf("[UDP] Session for %s timed out", clientKey)
-					return
-				}
-				sessionMu.Unlock()
-				continue
-			}
-			log.Printf("[UDP] Backend read error for %s: %v", clientKey, err)
-			break
-		}
-
-		sessionMu.Lock()
-		sess.lastActive = time.Now()
-		sessionMu.Unlock()
-
-		_, werr := listenConn.WriteToUDP(buf[:n], sess.clientAddr)
-		if werr != nil {
-			log.Printf("[UDP] Error writing to client %s: %v", clientKey, werr)
-			break
-		}
-	}
-
-	sessionMu.Lock()
-	delete(sessionMap, clientKey)
-	sessionMu.Unlock()
-	_ = sess.backendConn.Close()
-}
-
-// startUDPListener listens for UDP packets and forwards them to the backend.
-func startUDPListener(listenPort, targetIP, targetPort string) {
-	listenAddr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
-	if err != nil {
-		log.Fatalf("[UDP] Resolve error: %v", err)
-	}
-	listenConn, err := net.ListenUDP("udp", listenAddr)
-	if err != nil {
-		log.Fatalf("[UDP] Failed to listen on UDP port %s: %v", listenPort, err)
-	}
-	log.Printf("[UDP] Listening on port %s -> %s:%s", listenPort, targetIP, targetPort)
-
-	backendAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
-	if err != nil {
-		log.Fatalf("[UDP] Failed to resolve backend %s:%s: %v", targetIP, targetPort, err)
-	}
-
-	buf := make([]byte, 65535)
-	for {
-		n, clientAddr, err := listenConn.ReadFromUDP(buf)
-		if err != nil {
-			continue
-		}
-
-		clientKey := clientAddr.String()
-
-		sessionMu.Lock()
-		sess, exists := sessionMap[clientKey]
-		if !exists {
-			backendConn, berr := net.DialUDP("udp", nil, backendAddr)
-			if berr != nil {
-				sessionMu.Unlock()
-				log.Printf("[UDP] Dial backend error for %s: %v", clientKey, berr)
-				continue
-			}
-			sess = &udpSession{
-				clientAddr:  clientAddr,
-				backendConn: backendConn,
-				lastActive:  time.Now(),
-			}
-			sessionMap[clientKey] = sess
-			go handleUDPSession(listenConn, sess, clientKey)
-		} else {
-			sess.lastActive = time.Now()
-		}
-		sessionMu.Unlock()
-
-		_, werr := sess.backendConn.Write(buf[:n])
-		if werr != nil {
-			log.Printf("[UDP] Write to backend error for %s: %v", clientKey, werr)
-			continue
-		}
-	}
-}
-
-// ------------------------
-// Main
-// ------------------------
 
 func main() {
 	targetIP := flag.String("targetIP", "", "Backend server IP")
 	targetPort := flag.String("targetPort", "", "Backend server port")
 	listenPort := flag.String("listenPort", "", "Local port to listen on for TCP and UDP")
-	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL for alerts (optional)")
+	flag.StringVar(&discordWebhook, "discordWebhook", "", "Discord webhook URL for alerts (optional)")
 	flag.Parse()
 
 	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
@@ -222,13 +158,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The discordWebhook variable is available if needed for alerts.
-	_ = discordWebhook
+	serverAddr := net.JoinHostPort(*targetIP, *targetPort)
+	proxyAddr := ":" + *listenPort
 
-	// Start TCP and UDP listeners concurrently.
-	go startTCPListener(*listenPort, *targetIP, *targetPort)
-	go startUDPListener(*listenPort, *targetIP, *targetPort)
+	udpProxy, err := NewUDPProxy(proxyAddr, serverAddr)
+	if err != nil {
+		log.Fatalf("Failed to start UDP proxy: %v", err)
+	}
 
-	log.Printf("[INFO] Proxy forwarding to %s:%s on TCP/UDP port %s", *targetIP, *targetPort, *listenPort)
-	select {}
+	go udpProxy.Start()
+	startTCPProxy(proxyAddr, serverAddr)
 }
