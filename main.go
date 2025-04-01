@@ -119,22 +119,63 @@ var (
 	tcpConnCount int64
 )
 
+// updateWhitelist adds an IP to the whitelist.
 func updateWhitelist(ip string) {
 	whitelistedIPsMu.Lock()
 	whitelistedIPs[ip] = true
 	whitelistedIPsMu.Unlock()
 }
 
+// isWhitelisted checks if an IP is whitelisted.
 func isWhitelisted(ip string) bool {
 	whitelistedIPsMu.RLock()
 	defer whitelistedIPsMu.RUnlock()
 	return whitelistedIPs[ip]
 }
 
+// banIP adds an IP to the banned list.
 func banIP(ip string) {
 	bannedIPsMu.Lock()
 	bannedIPs[ip] = true
 	bannedIPsMu.Unlock()
+}
+
+// ------------------------
+// Rate Limiting for DDoS Prevention
+// ------------------------
+
+// For TCP: track connection attempts per IP.
+var (
+	connectionRates   = make(map[string]int)
+	connectionRatesMu sync.Mutex
+	tcpThreshold      = 10 // max allowed connections per 10 seconds
+)
+
+// For UDP: track packet counts per IP.
+var (
+	udpPacketCounts   = make(map[string]int)
+	udpPacketCountsMu sync.Mutex
+	udpThreshold      = 100 // max allowed UDP packets per 10 seconds
+)
+
+// resetTCPCounts clears the TCP connection counts every 10 seconds.
+func resetTCPCounts() {
+	ticker := time.NewTicker(10 * time.Second)
+	for range ticker.C {
+		connectionRatesMu.Lock()
+		connectionRates = make(map[string]int)
+		connectionRatesMu.Unlock()
+	}
+}
+
+// resetUDPPacketCounts clears the UDP packet counts every 10 seconds.
+func resetUDPPacketCounts() {
+	ticker := time.NewTicker(10 * time.Second)
+	for range ticker.C {
+		udpPacketCountsMu.Lock()
+		udpPacketCounts = make(map[string]int)
+		udpPacketCountsMu.Unlock()
+	}
 }
 
 // ------------------------
@@ -147,6 +188,24 @@ var (
 	ddosByteCount    uint64
 	ddosAttackActive bool
 )
+
+// ------------------------
+// Logging Helpers
+// ------------------------
+
+// logTCPError logs TCP errors only if they are not common closed/connection-reset errors.
+func logTCPError(prefix string, err error) {
+	if err == nil {
+		return
+	}
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "use of closed network connection") ||
+		strings.Contains(errMsg, "connection reset by peer") ||
+		strings.Contains(errMsg, "splice: connection reset by peer") {
+		return
+	}
+	log.Printf(">> [TCP] %s: %v", prefix, err)
+}
 
 // ------------------------
 // Handshake Detection
@@ -180,14 +239,29 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	defer conn.Close()
 	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 
+	// If the IP is banned, drop the connection.
 	bannedIPsMu.RLock()
 	if bannedIPs[clientIP] {
 		bannedIPsMu.RUnlock()
-		log.Printf(">> [TCP] Dropped connection from banned IP %s", clientIP)
+		// Minimal logging to avoid spam.
 		return
 	}
 	bannedIPsMu.RUnlock()
 
+	// Rate limit: count each new connection.
+	connectionRatesMu.Lock()
+	connectionRates[clientIP]++
+	if connectionRates[clientIP] > tcpThreshold {
+		bannedIPsMu.Lock()
+		bannedIPs[clientIP] = true
+		bannedIPsMu.Unlock()
+		connectionRatesMu.Unlock()
+		log.Printf(">> [TCP] [%s] Banned due to excessive connection attempts", clientIP)
+		return
+	}
+	connectionRatesMu.Unlock()
+
+	// If IP is already whitelisted, proxy immediately.
 	if isWhitelisted(clientIP) {
 		log.Printf(">> [TCP] [%s] Whitelisted - connection allowed", clientIP)
 		proxyTCP(conn, targetIP, targetPort)
@@ -249,7 +323,7 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
 }
 
-// Updated function: Uses keepalive and waits for both directions without prematurely closing idle connections.
+// proxyTCPWithConn forwards data between client and backend using two goroutines.
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	// Enable TCP keepalive on client connection if possible.
 	if tcpConn, ok := client.(*net.TCPConn); ok {
@@ -264,10 +338,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	go func() {
 		defer wg.Done()
 		_, err := io.Copy(backend, client)
-		if err != nil {
-			log.Printf(">> [TCP] Error copying from client to backend: %v", err)
-		}
-		// When the client stops sending, close the backend connection.
+		logTCPError("Error copying from client to backend", err)
 		backend.Close()
 	}()
 
@@ -275,10 +346,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	go func() {
 		defer wg.Done()
 		_, err := io.Copy(client, backend)
-		if err != nil {
-			log.Printf(">> [TCP] Error copying from backend to client: %v", err)
-		}
-		// When the backend stops sending, close the client connection.
+		logTCPError("Error copying from backend to client", err)
 		client.Close()
 	}()
 
@@ -300,9 +368,6 @@ type sessionData struct {
 var (
 	sessionMap = make(map[string]*sessionData)
 	sessionMu  sync.Mutex
-	// The cleanupTimer and sessionTTL are now unused because we are not dropping idle sessions.
-	// cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions (unused)
-	// sessionTTL   = 600 * time.Second // Idle timeout duration (unused)
 )
 
 // For UDP handshake tracking.
@@ -341,13 +406,12 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 
 	// Start DDoS monitoring.
 	go monitorDDoS(discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", targetIP, listenPort), targetPort)
-	// Idle session cleanup is disabled to keep sessions alive indefinitely.
 
 	buf := make([]byte, 2048)
 	for {
 		n, clientAddr, err := listenConn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf(">> [UDP] Read error: %v", err)
+			// Minimal logging to avoid console spam.
 			continue
 		}
 
@@ -357,15 +421,29 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 
 		clientIP := clientAddr.IP.String()
 
+		// Rate limit for UDP packets.
+		udpPacketCountsMu.Lock()
+		udpPacketCounts[clientIP]++
+		if udpPacketCounts[clientIP] > udpThreshold {
+			bannedIPsMu.Lock()
+			bannedIPs[clientIP] = true
+			bannedIPsMu.Unlock()
+			udpPacketCountsMu.Unlock()
+			// Log once when banning.
+			log.Printf(">> [UDP] [%s] Banned due to excessive packet rate", clientIP)
+			continue
+		}
+		udpPacketCountsMu.Unlock()
+
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
-			log.Printf(">> [UDP] Dropped packet from banned IP %s", clientIP)
+			// Avoid spamming banned logs.
 			continue
 		}
 		bannedIPsMu.RUnlock()
 
-		// If handshake check is not disabled, then perform handshake check for new IP.
+		// Handshake check (unless disabled).
 		if !isWhitelisted(clientIP) && !hasCheckedHandshake(clientIP) {
 			if !disableUDPHandshakeCheck {
 				if !isFiveMHandshake(buf[:n]) {
@@ -374,12 +452,11 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 					continue
 				}
 			}
-			// Either handshake check is disabled or it passed.
 			log.Printf(">> [UDP] [%s] Authenticated handshake (or bypassed) => whitelisted", clientIP)
 			updateWhitelist(clientIP)
 			markHandshakeChecked(clientIP)
 		} else if !isWhitelisted(clientIP) {
-			// If we've already checked handshake but not whitelisted, ban (unlikely case).
+			// If handshake was checked but not whitelisted, ban.
 			log.Printf(">> [UDP] [%s] No handshake pass => ban", clientIP)
 			banIP(clientIP)
 			continue
@@ -403,7 +480,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			sessionMap[clientAddr.String()] = sd
 			go handleUDPSession(listenConn, sd)
 		} else {
-			// Update lastActive timestamp (even though we no longer drop idle sessions).
+			// Update lastActive timestamp.
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
@@ -425,6 +502,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			// Only log errors that are not typical timeouts.
 			log.Printf(">> [UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
 			break
 		}
@@ -438,16 +516,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 			log.Printf(">> [UDP] Error writing to client %s: %v", sd.clientAddr, err)
 		}
 	}
-	// Do not automatically clean up session on error; keep connection alive until the client truly disconnects.
-}
-
-// ------------------------
-// Idle Session Cleanup (Disabled)
-// ------------------------
-
-// cleanupSessions is now a no-op so that idle UDP sessions remain alive indefinitely.
-func cleanupSessions() {
-	// Idle cleanup disabled.
+	// Keep connection alive until the client truly disconnects.
 }
 
 // ------------------------
@@ -525,6 +594,10 @@ func main() {
 	}
 
 	log.Printf(">> [INFO] Starting proxy: forwarding to %s:%s on port %s", *targetIP, *targetPort, *listenPort)
+
+	// Start rate limit reset goroutines.
+	go resetTCPCounts()
+	go resetUDPPacketCounts()
 
 	// Start TCP proxy in a goroutine.
 	go func() {
