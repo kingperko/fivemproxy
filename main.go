@@ -1,4 +1,4 @@
-package main
+us-chirack.fivegate.ggpackage main
 
 import (
 	"bytes"
@@ -261,24 +261,9 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	defer backendConn.Close()
 
-	// Send PROXY protocol header to forward original client IP.
-	tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr)
-	if !ok {
-		log.Printf(">> [TCP] [%s] Failed to assert client address type", clientIP)
-		return
-	}
-	proxyHeader := fmt.Sprintf("PROXY TCP4 %s %s %d %s\r\n", clientIP, targetIP, tcpAddr.Port, targetPort)
-	if _, err := backendConn.Write([]byte(proxyHeader)); err != nil {
-		log.Printf(">> [TCP] [%s] Error writing PROXY header: %v", clientIP, err)
-		return
-	}
 	// Forward the initial handshake data.
-	if _, err := backendConn.Write(buf[:n]); err != nil {
-		log.Printf(">> [TCP] [%s] Error writing handshake data: %v", clientIP, err)
-		return
-	}
-
-	// Start forwarding data concurrently using the forward function.
+	backendConn.Write(buf[:n])
+	// Now start forwarding data concurrently using the forward function.
 	go forward(conn, backendConn, false, clientIP, time.Now(), 4)
 	go forward(backendConn, conn, true, clientIP, time.Now(), 4)
 }
@@ -528,8 +513,11 @@ func main() {
 		}
 	}()
 
-	// Start UDproxy.
+	// Start UDP proxy.
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
+
+	// Start DDoS monitoring.
+	go monitorDDoS(*discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", *targetIP, *listenPort), *targetPort)
 
 	// Block forever.
 	select {}
