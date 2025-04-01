@@ -13,7 +13,7 @@ import (
 
 const (
 	bufferSize    = 65535
-	clientTimeout = 30 * time.Second
+	clientTimeout = 2 * time.Minute
 )
 
 var discordWebhook string
@@ -83,9 +83,9 @@ func (p *UDPProxy) listenServer(clientAddr *net.UDPAddr, conn *UDPConnection) {
 		conn.serverConn.SetReadDeadline(time.Now().Add(clientTimeout))
 		n, err := conn.serverConn.Read(buf)
 		if err != nil {
+			log.Printf("[UDP] Connection timeout for %s\n", clientAddr.String())
 			p.connections.Delete(clientAddr.String())
 			conn.serverConn.Close()
-			log.Printf("[UDP] Connection closed for %s\n", clientAddr.String())
 			return
 		}
 
@@ -94,7 +94,7 @@ func (p *UDPProxy) listenServer(clientAddr *net.UDPAddr, conn *UDPConnection) {
 }
 
 func (p *UDPProxy) Start() {
-	log.Printf("[UDP] Listening on %s\n", p.clientConn.LocalAddr().String())
+	log.Printf("[UDP] Proxy listening on %s\n", p.clientConn.LocalAddr().String())
 	buffer := make([]byte, bufferSize)
 	for {
 		n, clientAddr, err := p.clientConn.ReadFromUDP(buffer)
@@ -141,7 +141,7 @@ func startTCPProxy(proxyAddrTCP, serverAddr string) {
 	}
 	defer listener.Close()
 
-	log.Printf("[TCP] Listening on %s\n", proxyAddrTCP)
+	log.Printf("[TCP] Proxy listening on %s\n", proxyAddrTCP)
 	for {
 		client, err := listener.Accept()
 		if err != nil {
