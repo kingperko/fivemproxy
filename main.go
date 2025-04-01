@@ -1,190 +1,345 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"os"
+	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 )
 
-const (
-	bufferSize = 65535
-	// This implementation does not use forced timeouts to maintain persistent connections.
+var (
+	targetIP      string
+	targetPort    string
+	listenPort    string
+	httpPort      string
+	discordWebhook string
 )
 
-var discordWebhook string
-
-// UDPProxy handles UDP traffic by listening on a given address and forwarding packets to the backend.
-type UDPProxy struct {
-	clientConn  *net.UDPConn      // UDP socket for incoming client packets.
-	serverAddr  *net.UDPAddr      // Backend server's UDP address.
-	connections sync.Map          // Maps client address string to *UDPConnection.
-}
-
-// UDPConnection holds a connection to the backend for a specific client.
-type UDPConnection struct {
-	serverConn *net.UDPConn // The UDP connection from proxy to backend.
-	// lastActive is available for potential cleanup but is not used here.
-}
-
-// NewUDPProxy creates and returns a UDPProxy listening on localAddr and forwarding to serverAddr.
-func NewUDPProxy(localAddr, serverAddr string) (*UDPProxy, error) {
-	clientUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve local UDP addr %s: %w", localAddr, err)
-	}
-	clientConn, err := net.ListenUDP("udp", clientUDPAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to listen on %s: %w", localAddr, err)
-	}
-	serverUDPAddr, err := net.ResolveUDPAddr("udp", serverAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve server UDP addr %s: %w", serverAddr, err)
-	}
-	return &UDPProxy{
-		clientConn: clientConn,
-		serverAddr: serverUDPAddr,
-	}, nil
-}
-
-// handleClient forwards data received from a client to the backend server.
-// If a connection for this client does not exist, it creates one.
-func (p *UDPProxy) handleClient(clientAddr *net.UDPAddr, data []byte) {
-	conn, loaded := p.connections.Load(clientAddr.String())
-	if !loaded {
-		// Create a new connection to the backend server.
-		serverConn, err := net.DialUDP("udp", nil, p.serverAddr)
-		if err != nil {
-			log.Printf("[UDP] Error connecting to backend for %s: %v\n", clientAddr, err)
-			return
-		}
-		newConn := &UDPConnection{
-			serverConn: serverConn,
-		}
-		p.connections.Store(clientAddr.String(), newConn)
-		go p.listenServer(clientAddr, newConn)
-		log.Printf("[UDP] New client %s proxied to %s\n", clientAddr.String(), p.serverAddr.String())
-		conn = newConn
-	}
-	udpConn := conn.(*UDPConnection)
-	_, err := udpConn.serverConn.Write(data)
-	if err != nil {
-		log.Printf("[UDP] Error writing to backend for %s: %v\n", clientAddr.String(), err)
-	}
-}
-
-// listenServer continuously reads from the backend server for a given client
-// and forwards any received packets back to that client.
-func (p *UDPProxy) listenServer(clientAddr *net.UDPAddr, conn *UDPConnection) {
-	buf := make([]byte, bufferSize)
-	for {
-		n, err := conn.serverConn.Read(buf)
-		if err != nil {
-			log.Printf("[UDP] Error reading from backend for client %s: %v\n", clientAddr.String(), err)
-			p.connections.Delete(clientAddr.String())
-			conn.serverConn.Close()
-			return
-		}
-		_, werr := p.clientConn.WriteToUDP(buf[:n], clientAddr)
-		if werr != nil {
-			log.Printf("[UDP] Error writing to client %s: %v\n", clientAddr.String(), werr)
-		}
-	}
-}
-
-// Start begins the UDP proxy loop.
-func (p *UDPProxy) Start() {
-	log.Printf("[UDP] Proxy listening on %s and forwarding to %s\n", p.clientConn.LocalAddr().String(), p.serverAddr.String())
-	buf := make([]byte, bufferSize)
-	for {
-		n, clientAddr, err := p.clientConn.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("[UDP] Error reading from UDP: %v\n", err)
-			continue
-		}
-		go p.handleClient(clientAddr, buf[:n])
-	}
-}
-
-// handleTCPConnection creates a TCP connection between the client and backend,
-// copying data in both directions.
-func handleTCPConnection(client net.Conn, serverAddr string) {
-	defer client.Close()
-	log.Printf("[TCP] New connection from %s\n", client.RemoteAddr().String())
-	server, err := net.Dial("tcp", serverAddr)
-	if err != nil {
-		log.Printf("[TCP] Error connecting to backend at %s: %v\n", serverAddr, err)
-		return
-	}
-	defer server.Close()
-	var wg sync.WaitGroup
-	wg.Add(2)
-	// Client → Server
-	go func() {
-		defer wg.Done()
-		io.Copy(server, client)
-	}()
-	// Server → Client
-	go func() {
-		defer wg.Done()
-		io.Copy(client, server)
-	}()
-	wg.Wait()
-	log.Printf("[TCP] Closed connection from %s\n", client.RemoteAddr().String())
-}
-
-// startTCPProxy listens for TCP connections on localAddr and proxies them to the backend.
-func startTCPProxy(localAddr, serverAddr string) {
-	listener, err := net.Listen("tcp", localAddr)
-	if err != nil {
-		log.Fatalf("[TCP] Error listening on %s: %v", localAddr, err)
-	}
-	defer listener.Close()
-	log.Printf("[TCP] Proxy listening on %s and forwarding to %s\n", listener.Addr().String(), serverAddr)
-	for {
-		client, err := listener.Accept()
-		if err != nil {
-			log.Printf("[TCP] Error accepting connection: %v\n", err)
-			continue
-		}
-		go handleTCPConnection(client, serverAddr)
-	}
+func init() {
+	flag.StringVar(&targetIP, "targetIP", "127.0.0.1", "Backend server IP")
+	flag.StringVar(&targetPort, "targetPort", "30120", "Backend server port")
+	flag.StringVar(&listenPort, "listenPort", "30120", "Port for TCP/UDP proxy")
+	flag.StringVar(&httpPort, "httpPort", "443", "Port for HTTP caching proxy")
+	flag.StringVar(&discordWebhook, "discordWebhook", "", "Optional Discord webhook for DDoS alerts")
+	flag.Parse()
 }
 
 func main() {
-	// Command-line flags.
-	listenHost := flag.String("listenHost", "0.0.0.0", "Local IP to bind for proxy (as assigned by Pterodactyl)")
-	listenPort := flag.String("listenPort", "", "Local port to listen on for TCP and UDP (as assigned by Pterodactyl)")
-	targetIP := flag.String("targetIP", "", "Backend (real) FiveM server IP")
-	targetPort := flag.String("targetPort", "", "Backend (real) FiveM server port")
-	flag.StringVar(&discordWebhook, "discordWebhook", "", "Discord webhook URL for alerts (optional)")
-	flag.Parse()
+	// Start TCP proxy
+	go startTCPProxy()
 
-	if *listenPort == "" || *targetIP == "" || *targetPort == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s -listenHost=0.0.0.0 -listenPort=<port> -targetIP=<backend IP> -targetPort=<backend port>\n", os.Args[0])
-		os.Exit(1)
+	// Start UDP proxy
+	go startUDPProxy()
+
+	// Start HTTP reverse proxy with caching
+	go startHTTPProxy()
+
+	// Block forever
+	select {}
+}
+
+// --- Rate Limiting and Alerting ---
+
+// A map to track rate limiters per client IP.
+var limiterStore = sync.Map{}
+
+// getLimiter returns a rate limiter for the given IP (10 req/sec, burst 20).
+func getLimiter(ip string) *rate.Limiter {
+	if l, ok := limiterStore.Load(ip); ok {
+		return l.(*rate.Limiter)
 	}
+	lim := rate.NewLimiter(10, 20)
+	limiterStore.Store(ip, lim)
+	return lim
+}
 
-	localAddr := net.JoinHostPort(*listenHost, *listenPort)
-	serverAddr := net.JoinHostPort(*targetIP, *targetPort)
-
-	// NOTE for Pterodactyl:
-	// - Ensure that the panel's configuration allows both TCP and UDP on the assigned port.
-	// - You may need to enable host networking or configure port mapping for UDP.
-	// - Verify that any firewalls allow the necessary inbound and outbound traffic.
-
-	log.Printf("Starting FiveM Proxy on %s, forwarding to backend %s\n", localAddr, serverAddr)
-
-	// Start UDP proxy in a goroutine.
-	udpProxy, err := NewUDPProxy(localAddr, serverAddr)
+// sendDiscordAlert sends an alert to the configured Discord webhook.
+func sendDiscordAlert(message string) {
+	if discordWebhook == "" {
+		return
+	}
+	payload := map[string]string{"content": message}
+	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Fatalf("[UDP] Failed to start proxy: %v\n", err)
+		log.Println("Discord payload marshal error:", err)
+		return
 	}
-	go udpProxy.Start()
+	req, err := http.NewRequest("POST", discordWebhook, bytes.NewBuffer(body))
+	if err != nil {
+		log.Println("Discord request creation error:", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Println("Discord alert send error:", err)
+		return
+	}
+	resp.Body.Close()
+}
 
-	// Start TCP proxy (this will handle HTTP and any other TCP-based traffic).
-	startTCPProxy(localAddr, serverAddr)
+// --- TCP Proxy ---
+
+func startTCPProxy() {
+	addr := ":" + listenPort
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("TCP listen error: %v", err)
+	}
+	log.Printf("TCP proxy listening on %s", addr)
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println("TCP accept error:", err)
+			continue
+		}
+		go handleTCPConn(conn)
+	}
+}
+
+func handleTCPConn(client net.Conn) {
+	defer client.Close()
+	clientIP, _, _ := net.SplitHostPort(client.RemoteAddr().String())
+	limiter := getLimiter(clientIP)
+	if !limiter.Allow() {
+		log.Printf("TCP connection rate limited for %s", clientIP)
+		sendDiscordAlert(fmt.Sprintf("TCP connection rate limited for %s", clientIP))
+		return
+	}
+
+	backendAddr := net.JoinHostPort(targetIP, targetPort)
+	server, err := net.Dial("tcp", backendAddr)
+	if err != nil {
+		log.Println("TCP dial error:", err)
+		return
+	}
+	defer server.Close()
+
+	// Bidirectionally copy data between client and server.
+	go io.Copy(server, client)
+	io.Copy(client, server)
+}
+
+// --- UDP Proxy ---
+
+func startUDPProxy() {
+	addr := ":" + listenPort
+	conn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		log.Fatalf("UDP listen error: %v", err)
+	}
+	log.Printf("UDP proxy listening on %s", addr)
+	clientMap := make(map[string]*udpProxyConn)
+	var mu sync.Mutex
+	buf := make([]byte, 65535)
+	for {
+		n, clientAddr, err := conn.ReadFrom(buf)
+		if err != nil {
+			log.Println("UDP read error:", err)
+			continue
+		}
+		clientKey := clientAddr.String()
+		mu.Lock()
+		proxyConn, exists := clientMap[clientKey]
+		if !exists {
+			backendAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
+			if err != nil {
+				mu.Unlock()
+				log.Println("UDP resolve error:", err)
+				continue
+			}
+			proxyConn = newUDPProxyConn(clientAddr, backendAddr, conn)
+			clientMap[clientKey] = proxyConn
+			go proxyConn.handleUDP(&mu, clientMap)
+		}
+		mu.Unlock()
+		// Copy the received packet into a new slice and send to the proxy handler.
+		packet := make([]byte, n)
+		copy(packet, buf[:n])
+		proxyConn.incoming <- packet
+	}
+}
+
+type udpProxyConn struct {
+	clientAddr  net.Addr
+	backendAddr *net.UDPAddr
+	lastActive  time.Time
+	conn        net.PacketConn
+	incoming    chan []byte
+}
+
+func newUDPProxyConn(clientAddr net.Addr, backendAddr *net.UDPAddr, conn net.PacketConn) *udpProxyConn {
+	return &udpProxyConn{
+		clientAddr:  clientAddr,
+		backendAddr: backendAddr,
+		lastActive:  time.Now(),
+		conn:        conn,
+		incoming:    make(chan []byte, 1024),
+	}
+}
+
+func (u *udpProxyConn) handleUDP(mu *sync.Mutex, clientMap map[string]*udpProxyConn) {
+	backendConn, err := net.DialUDP("udp", nil, u.backendAddr)
+	if err != nil {
+		log.Println("UDP dial backend error:", err)
+		return
+	}
+	defer backendConn.Close()
+
+	backendChan := make(chan []byte, 1024)
+	done := make(chan struct{})
+
+	// Read from the backend.
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			backendConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			n, err := backendConn.Read(buf)
+			if err != nil {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				continue
+			}
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			backendChan <- data
+		}
+	}()
+
+	// Process incoming packets and backend responses.
+	for {
+		select {
+		case data := <-u.incoming:
+			u.lastActive = time.Now()
+			_, err := backendConn.Write(data)
+			if err != nil {
+				log.Println("UDP write to backend error:", err)
+			}
+		case data := <-backendChan:
+			_, err := u.conn.WriteTo(data, u.clientAddr)
+			if err != nil {
+				log.Println("UDP write to client error:", err)
+			}
+		case <-time.After(30 * time.Second):
+			// Clean up after 30 seconds of inactivity.
+			if time.Since(u.lastActive) > 30*time.Second {
+				mu.Lock()
+				delete(clientMap, u.clientAddr.String())
+				mu.Unlock()
+				close(done)
+				return
+			}
+		}
+	}
+}
+
+// --- HTTP Proxy with Caching ---
+
+func startHTTPProxy() {
+	// Create a reverse proxy to forward all non-cached requests.
+	backendURL := "http://" + net.JoinHostPort(targetIP, targetPort)
+	proxy := httputil.NewSingleHostReverseProxy(&http.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(targetIP, targetPort),
+	})
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.Host = req.URL.Host
+	}
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		limiter := getLimiter(clientIP)
+		if !limiter.Allow() {
+			log.Printf("HTTP connection rate limited for %s", clientIP)
+			sendDiscordAlert(fmt.Sprintf("HTTP connection rate limited for %s", clientIP))
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		// If the request path starts with /files/, attempt to serve from cache.
+		if strings.HasPrefix(r.URL.Path, "/files/") {
+			serveCached(w, r, backendURL)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})
+
+	addr := ":" + httpPort
+	log.Printf("HTTP proxy listening on %s", addr)
+	// For simplicity, this example runs as plain HTTP. TLS can be added if needed.
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("HTTP server error: %v", err)
+	}
+}
+
+// serveCached checks for a cached response for /files/ requests and, if absent, fetches and stores it.
+func serveCached(w http.ResponseWriter, r *http.Request, backendURL string) {
+	cacheDir := "./cache"
+	os.MkdirAll(cacheDir, 0755)
+	// Create a safe cache key from the full request URI.
+	cacheKey := strings.ReplaceAll(r.URL.RequestURI(), "/", "_")
+	cachePath := cacheDir + "/" + cacheKey
+
+	// Check if a valid cached file exists (valid for 1 year).
+	if info, err := os.Stat(cachePath); err == nil && time.Since(info.ModTime()) < 365*24*time.Hour {
+		http.ServeFile(w, r, cachePath)
+		return
+	}
+
+	// Otherwise, fetch from backend.
+	backendReq, err := http.NewRequestWithContext(context.Background(), r.Method, backendURL+r.URL.RequestURI(), nil)
+	if err != nil {
+		http.Error(w, "Error creating backend request", http.StatusInternalServerError)
+		return
+	}
+	for k, vv := range r.Header {
+		for _, v := range vv {
+			backendReq.Header.Add(k, v)
+		}
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(backendReq)
+	if err != nil {
+		http.Error(w, "Error fetching from backend", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy headers and status code.
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Open cache file for writing.
+	f, err := os.Create(cachePath)
+	if err != nil {
+		log.Println("Cache file creation error:", err)
+	}
+	defer func() {
+		if f != nil {
+			f.Close()
+		}
+	}()
+	mw := io.MultiWriter(w, f)
+	io.Copy(mw, resp.Body)
 }
