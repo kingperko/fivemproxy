@@ -214,12 +214,16 @@ func main() {
 	targetIP := flag.String("targetIP", "", "Backend server IP")
 	targetPort := flag.String("targetPort", "", "Backend server port")
 	listenPort := flag.String("listenPort", "", "Local port to listen on for TCP and UDP")
+	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL for alerts (optional)")
 	flag.Parse()
 
 	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port> [-discordWebhook=<url>]\n", os.Args[0])
 		os.Exit(1)
 	}
+
+	// The discordWebhook variable is available if needed for alerts.
+	_ = discordWebhook
 
 	// Start TCP and UDP listeners concurrently.
 	go startTCPListener(*listenPort, *targetIP, *targetPort)
