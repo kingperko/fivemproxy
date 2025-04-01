@@ -20,10 +20,10 @@ import (
 )
 
 var (
-	targetIP      string
-	targetPort    string
-	listenPort    string
-	httpPort      string
+	targetIP       string
+	targetPort     string
+	listenPort     string
+	httpPort       string
 	discordWebhook string
 )
 
