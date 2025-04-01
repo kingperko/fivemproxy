@@ -330,7 +330,7 @@ func serveCached(w http.ResponseWriter, r *http.Request, backendURL string) {
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	// Open cache file for writing.
+	// Open cache file forwriting.
 	f, err := os.Create(cachePath)
 	if err != nil {
 		log.Println("Cache file creation error:", err)
