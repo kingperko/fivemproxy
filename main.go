@@ -420,19 +420,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 
 		clientIP := clientAddr.IP.String()
 
-		// Rate limit for UDP packets.
-		udpPacketCountsMu.Lock()
-		udpPacketCounts[clientIP]++
-		if udpPacketCounts[clientIP] > udpThreshold {
-			bannedIPsMu.Lock()
-			bannedIPs[clientIP] = true
-			bannedIPsMu.Unlock()
-			udpPacketCountsMu.Unlock()
-			log.Printf(">> [UDP] [%s] Banned due to excessive packet rate", clientIP)
-			continue
-		}
-		udpPacketCountsMu.Unlock()
-
+		// Check if the IP is banned.
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
@@ -456,6 +444,21 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			log.Printf(">> [UDP] [%s] No handshake pass => ban", clientIP)
 			banIP(clientIP)
 			continue
+		}
+
+		// Only apply UDP rate limiting if the IP is not whitelisted.
+		if !isWhitelisted(clientIP) {
+			udpPacketCountsMu.Lock()
+			udpPacketCounts[clientIP]++
+			if udpPacketCounts[clientIP] > udpThreshold {
+				bannedIPsMu.Lock()
+				bannedIPs[clientIP] = true
+				bannedIPsMu.Unlock()
+				udpPacketCountsMu.Unlock()
+				log.Printf(">> [UDP] [%s] Banned due to excessive packet rate", clientIP)
+				continue
+			}
+			udpPacketCountsMu.Unlock()
 		}
 
 		// Normal flow: IP is whitelisted.
