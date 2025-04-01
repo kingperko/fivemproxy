@@ -11,18 +11,17 @@ import (
 )
 
 func main() {
-	// Command-line flags
+	// Command-line flags for backend and listening port.
 	targetIP := flag.String("targetIP", "", "Backend server IP address")
 	targetPort := flag.String("targetPort", "", "Backend server port")
 	listenPort := flag.String("listenPort", "", "Port on which the proxy listens")
 	flag.Parse()
 
 	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
-		log.Fatalf("Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port>", 
-			flag.CommandLine.Name())
+		log.Fatalf("Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port>", flag.CommandLine.Name())
 	}
 
-	// Start listening for incoming connections.
+	// Start listening for incoming TCP connections.
 	listener, err := net.Listen("tcp", ":"+*listenPort)
 	if err != nil {
 		log.Fatalf("Error starting listener on port %s: %v", *listenPort, err)
@@ -43,12 +42,12 @@ func main() {
 func handleConnection(clientConn net.Conn, targetIP, targetPort string) {
 	defer clientConn.Close()
 
-	// Get client info
+	// Extract client IP and port.
 	clientAddr := clientConn.RemoteAddr().(*net.TCPAddr)
 	clientIP := clientAddr.IP.String()
 	clientPort := strconv.Itoa(clientAddr.Port)
 
-	// Dial backend server
+	// Connect to the backend server with a timeout.
 	backendConn, err := net.DialTimeout("tcp", net.JoinHostPort(targetIP, targetPort), 5*time.Second)
 	if err != nil {
 		log.Printf("Error connecting to backend %s:%s: %v", targetIP, targetPort, err)
@@ -64,10 +63,16 @@ func handleConnection(clientConn net.Conn, targetIP, targetPort string) {
 		return
 	}
 
-	// Log connection established
 	log.Printf("Connection from %s forwarded to %s:%s", clientConn.RemoteAddr(), targetIP, targetPort)
 
-	// Pipe data between client and backend
-	go io.Copy(backendConn, clientConn)
-	io.Copy(clientConn, backendConn)
+	// Bidirectionally copy data between client and backend.
+	go func() {
+		if _, err := io.Copy(backendConn, clientConn); err != nil {
+			log.Printf("Error copying from client to backend: %v", err)
+		}
+		backendConn.Close()
+	}()
+	if _, err := io.Copy(clientConn, backendConn); err != nil {
+		log.Printf("Error copying from backend to client: %v", err)
+	}
 }
