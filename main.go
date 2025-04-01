@@ -1,4 +1,4 @@
-us-chirack.fivegate.ggpackage main
+package main
 
 import (
 	"bytes"
