@@ -528,7 +528,7 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy.
+	// Start UDproxy.
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
 	// Block forever.
