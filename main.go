@@ -11,8 +11,10 @@ import (
 	"time"
 )
 
-const bufferSize = 65535
-const clientTimeout = 60 * time.Second
+const (
+	bufferSize    = 65535
+	clientTimeout = 30 * time.Second
+)
 
 var discordWebhook string
 
@@ -54,7 +56,7 @@ func (p *UDPProxy) handleClient(clientAddr *net.UDPAddr, data []byte) {
 	if !loaded {
 		serverConn, err := net.DialUDP("udp", nil, p.serverAddr)
 		if err != nil {
-			log.Printf("UDP dial error: %v\n", err)
+			log.Printf("[UDP] Error connecting to backend: %v\n", err)
 			return
 		}
 
@@ -67,6 +69,7 @@ func (p *UDPProxy) handleClient(clientAddr *net.UDPAddr, data []byte) {
 
 		go p.listenServer(clientAddr, newConn)
 		conn = newConn
+		log.Printf("[UDP] New connection from %s\n", clientAddr.String())
 	}
 
 	udpConn := conn.(*UDPConnection)
@@ -82,6 +85,7 @@ func (p *UDPProxy) listenServer(clientAddr *net.UDPAddr, conn *UDPConnection) {
 		if err != nil {
 			p.connections.Delete(clientAddr.String())
 			conn.serverConn.Close()
+			log.Printf("[UDP] Connection closed for %s\n", clientAddr.String())
 			return
 		}
 
@@ -90,12 +94,12 @@ func (p *UDPProxy) listenServer(clientAddr *net.UDPAddr, conn *UDPConnection) {
 }
 
 func (p *UDPProxy) Start() {
-	log.Printf("[UDP] Proxy listening on %s\n", p.clientConn.LocalAddr().String())
+	log.Printf("[UDP] Listening on %s\n", p.clientConn.LocalAddr().String())
 	buffer := make([]byte, bufferSize)
 	for {
 		n, clientAddr, err := p.clientConn.ReadFromUDP(buffer)
 		if err != nil {
-			log.Printf("Client UDP read error: %v\n", err)
+			log.Printf("[UDP] Read error: %v\n", err)
 			continue
 		}
 		go p.handleClient(clientAddr, buffer[:n])
@@ -104,10 +108,11 @@ func (p *UDPProxy) Start() {
 
 func handleTCPConnection(client net.Conn, serverAddr string) {
 	defer client.Close()
+	log.Printf("[TCP] New connection from %s\n", client.RemoteAddr().String())
 
 	server, err := net.Dial("tcp", serverAddr)
 	if err != nil {
-		log.Printf("TCP dial error: %v\n", err)
+		log.Printf("[TCP] Backend dial error: %v\n", err)
 		return
 	}
 	defer server.Close()
@@ -126,20 +131,21 @@ func handleTCPConnection(client net.Conn, serverAddr string) {
 	}()
 
 	wg.Wait()
+	log.Printf("[TCP] Connection closed for %s\n", client.RemoteAddr().String())
 }
 
 func startTCPProxy(proxyAddrTCP, serverAddr string) {
 	listener, err := net.Listen("tcp", proxyAddrTCP)
 	if err != nil {
-		log.Fatalf("TCP Listen error: %v", err)
+		log.Fatalf("[TCP] Listen error: %v", err)
 	}
 	defer listener.Close()
 
-	log.Printf("[TCP] Proxy listening on %s\n", proxyAddrTCP)
+	log.Printf("[TCP] Listening on %s\n", proxyAddrTCP)
 	for {
 		client, err := listener.Accept()
 		if err != nil {
-			log.Printf("TCP accept error: %v\n", err)
+			log.Printf("[TCP] Accept error: %v\n", err)
 			continue
 		}
 		go handleTCPConnection(client, serverAddr)
@@ -163,7 +169,7 @@ func main() {
 
 	udpProxy, err := NewUDPProxy(proxyAddr, serverAddr)
 	if err != nil {
-		log.Fatalf("Failed to start UDP proxy: %v", err)
+		log.Fatalf("[UDP] Failed to start proxy: %v", err)
 	}
 
 	go udpProxy.Start()
