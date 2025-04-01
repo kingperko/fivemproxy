@@ -155,7 +155,7 @@ var (
 var (
 	udpPacketCounts   = make(map[string]int)
 	udpPacketCountsMu sync.Mutex
-	udpThreshold      = 100 // max allowed UDP packets per 10 seconds
+	udpThreshold      = 500 // increased threshold for legitimate traffic bursts
 )
 
 // resetTCPCounts clears the TCP connection counts every 10 seconds.
@@ -243,7 +243,6 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	bannedIPsMu.RLock()
 	if bannedIPs[clientIP] {
 		bannedIPsMu.RUnlock()
-		// Minimal logging to avoid spam.
 		return
 	}
 	bannedIPsMu.RUnlock()
@@ -429,7 +428,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			bannedIPs[clientIP] = true
 			bannedIPsMu.Unlock()
 			udpPacketCountsMu.Unlock()
-			// Log once when banning.
 			log.Printf(">> [UDP] [%s] Banned due to excessive packet rate", clientIP)
 			continue
 		}
@@ -438,7 +436,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
-			// Avoid spamming banned logs.
 			continue
 		}
 		bannedIPsMu.RUnlock()
@@ -456,7 +453,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			updateWhitelist(clientIP)
 			markHandshakeChecked(clientIP)
 		} else if !isWhitelisted(clientIP) {
-			// If handshake was checked but not whitelisted, ban.
 			log.Printf(">> [UDP] [%s] No handshake pass => ban", clientIP)
 			banIP(clientIP)
 			continue
@@ -480,7 +476,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			sessionMap[clientAddr.String()] = sd
 			go handleUDPSession(listenConn, sd)
 		} else {
-			// Update lastActive timestamp.
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
@@ -502,11 +497,9 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-			// Only log errors that are not typical timeouts.
 			log.Printf(">> [UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
 			break
 		}
-		// Update lastActive on receiving backend data.
 		sessionMu.Lock()
 		sd.lastActive = time.Now()
 		sessionMu.Unlock()
