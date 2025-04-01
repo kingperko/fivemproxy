@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -232,9 +233,27 @@ func isFiveMHandshake(data []byte) bool {
 }
 
 // ------------------------
+// PROXY Protocol Helper (TCP)
+// ------------------------
+
+// sendProxyHeader writes a PROXY protocol v1 header to the backend connection.
+// Format: "PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n"
+func sendProxyHeader(client net.Addr, targetIP, targetPort string, backend net.Conn) error {
+	tcpAddr, ok := client.(*net.TCPAddr)
+	if !ok {
+		return errors.New("client address is not a TCPAddr")
+	}
+	// For simplicity, we assume IPv4. For IPv6, adjust accordingly.
+	header := fmt.Sprintf("PROXY TCP4 %s %s %d %s\r\n", tcpAddr.IP.String(), targetIP, tcpAddr.Port, targetPort)
+	_, err := backend.Write([]byte(header))
+	return err
+}
+
+// ------------------------
 // TCP Proxy Logic
 // ------------------------
 
+// handleTCPConnection performs an initial handshake, validates, then proxies the connection.
 func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook string) {
 	defer conn.Close()
 	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
@@ -302,11 +321,21 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	defer backendConn.Close()
 
+	// Send the PROXY header so the backend sees the original client IP.
+	if err := sendProxyHeader(conn.RemoteAddr(), targetIP, targetPort, backendConn); err != nil {
+		log.Printf(">> [TCP] [%s] Failed to send proxy header: %v", clientIP, err)
+		return
+	}
+
 	// Forward the handshake data.
-	backendConn.Write(buf[:n])
+	if _, err := backendConn.Write(buf[:n]); err != nil {
+		log.Printf(">> [TCP] [%s] Failed to forward handshake: %v", clientIP, err)
+		return
+	}
 	proxyTCPWithConn(conn, backendConn, clientIP)
 }
 
+// proxyTCP creates a backend connection and proxies data after sending the PROXY header.
 func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -319,6 +348,13 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 	defer backendConn.Close()
+
+	// Send the PROXY header.
+	if err := sendProxyHeader(client.RemoteAddr(), targetIP, targetPort, backendConn); err != nil {
+		log.Printf(">> [TCP] Failed to send proxy header: %v", err)
+		return
+	}
+
 	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
 }
 
@@ -354,7 +390,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 }
 
 // ------------------------
-// UDP Proxy Logic (Persistent Sessions with Handshake Check)
+// UDP Proxy Logic (with custom UDP header)
 // ------------------------
 
 type sessionData struct {
@@ -387,6 +423,9 @@ func markHandshakeChecked(key string) {
 	udpHandshakeCheckedMu.Unlock()
 }
 
+// startUDPProxy creates a UDP listener that forwards packets to the backend.
+// Each packet sent to the backend is prepended with a custom header in the format:
+// "PROXY UDP <src_ip> <dst_ip> <src_port> <dst_port>\r\n"
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	listenAddr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
@@ -410,7 +449,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	for {
 		n, clientAddr, err := listenConn.ReadFromUDP(buf)
 		if err != nil {
-			// Minimal logging to avoid console spam.
 			continue
 		}
 
@@ -452,7 +490,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		udpPacketCounts[clientKey]++
 		if udpPacketCounts[clientKey] > udpThreshold {
 			bannedIPsMu.Lock()
-			// Banning based on IP since multiple sessions from same client key are unlikely.
 			bannedIPs[clientAddr.IP.String()] = true
 			bannedIPsMu.Unlock()
 			udpPacketCountsMu.Unlock()
@@ -477,13 +514,16 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 				lastActive:  time.Now(),
 			}
 			sessionMap[clientKey] = sd
-			go handleUDPSession(listenConn, sd)
+			go handleUDPSession(listenConn, sd, clientKey)
 		} else {
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
 
-		_, err = sd.backendConn.Write(buf[:n])
+		// Create a custom UDP header and forward the packet.
+		udpHeader := fmt.Sprintf("PROXY UDP %s %s %d %s\r\n", clientAddr.IP.String(), targetIP, clientAddr.Port, targetPort)
+		packet := append([]byte(udpHeader), buf[:n]...)
+		_, err = sd.backendConn.Write(packet)
 		if err != nil {
 			log.Printf(">> [UDP] Write to backend error for client %s: %v", clientKey, err)
 			continue
@@ -491,13 +531,22 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	}
 }
 
-func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
+func handleUDPSession(listenConn *net.UDPConn, sd *sessionData, clientKey string) {
 	buf := make([]byte, 2048)
+	idleTimeout := 60 * time.Second
 	for {
 		sd.backendConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := sd.backendConn.Read(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				sessionMu.Lock()
+				if time.Since(sd.lastActive) > idleTimeout {
+					delete(sessionMap, clientKey)
+					sessionMu.Unlock()
+					log.Printf(">> [UDP] [%s] Session idle, closing", clientKey)
+					return
+				}
+				sessionMu.Unlock()
 				continue
 			}
 			log.Printf(">> [UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
@@ -506,13 +555,14 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 		sessionMu.Lock()
 		sd.lastActive = time.Now()
 		sessionMu.Unlock()
-
 		_, err = listenConn.WriteToUDP(buf[:n], sd.clientAddr)
 		if err != nil {
 			log.Printf(">> [UDP] Error writing to client %s: %v", sd.clientAddr, err)
 		}
 	}
-	// Keep connection alive until the client truly disconnects.
+	sessionMu.Lock()
+	delete(sessionMap, clientKey)
+	sessionMu.Unlock()
 }
 
 // ------------------------
