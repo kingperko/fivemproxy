@@ -15,32 +15,40 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"runtime"
 )
 
 // ------------------------
 // Configuration
 // ------------------------
 
-// If you want more detailed logging (for debugging), set this to true.
+// Set this to true if you want more detailed logs (debug).
 const debugMode = false
 
-// For Discord notifications (set to false if you do not want them at all).
+// If you do not want Discord alerts at all, set this to true.
 const disableDiscord = false
 
-// Adjust these to tune rate limiting:
-const (
-	tcpBucketCapacity   = 20.0 // Maximum tokens per IP for TCP connections
-	tcpBucketRefillRate = 2.0  // Tokens per second refill for TCP
+// Basic concurrency limit for new (non‐whitelisted) TCP connections from a single IP.
+const maxConcurrentTCPPerIP = 3
 
-	udpBucketCapacity   = 50.0 // Maximum tokens per IP for UDP packets
-	udpBucketRefillRate = 10.0 // Tokens per second refill for UDP
+// UDP token bucket parameters (for non‐whitelisted IPs).
+// Setting these high ensures we only drop massive floods.
+const (
+	udpBucketCapacity   = 500.0
+	udpBucketRefillRate = 100.0 // tokens/second
 )
 
-// DDoS drop threshold per interval (10s) for sending an alert.
+// If you still want a small TCP token bucket for brand‐new IPs, you can define it here.
+const (
+	tcpBucketCapacity   = 50.0
+	tcpBucketRefillRate = 10.0
+)
+
+// DDoS drop threshold for alerting in each 10‐second interval.
 const dropThreshold = 200
 
 // ------------------------
-// Discord Notification Support
+// Discord Notification
 // ------------------------
 
 type discordEmbed struct {
@@ -64,7 +72,7 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 		Color:       color,
 	}
 	payload := discordWebhookBody{
-		Username: "Enhanced Firewall",
+		Username: "Firewall Proxy",
 		Embeds:   []discordEmbed{embed},
 	}
 	jsonData, err := json.Marshal(payload)
@@ -90,14 +98,14 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 	}
 }
 
-func sendDDoSAttackStarted(webhookURL, serverName, serverIP, targetPort string) {
-	title := "Enhanced Firewall Alert"
-	description := "Mitigation started: High drop rates detected. DDoS attack in progress."
+func sendDDoSAttackStarted(webhookURL string) {
+	title := "Firewall Alert"
+	description := "Mitigation started: High drop rates detected."
 	sendDiscordEmbed(webhookURL, title, description, 0xff0000)
 }
 
-func sendDDoSAttackEnded(webhookURL, serverName, serverIP, targetPort string) {
-	title := "Enhanced Firewall Alert"
+func sendDDoSAttackEnded(webhookURL string) {
+	title := "Firewall Alert"
 	description := "Mitigation ended: Traffic levels have normalized."
 	sendDiscordEmbed(webhookURL, title, description, 0x00ff00)
 }
@@ -113,7 +121,7 @@ func debugLog(format string, v ...interface{}) {
 }
 
 // ------------------------
-// Global Firewall Variables & Helpers
+// Whitelist / Ban Lists
 // ------------------------
 
 var (
@@ -122,20 +130,24 @@ var (
 
 	bannedIPs   = make(map[string]bool)
 	bannedIPsMu sync.RWMutex
-
-	tcpConnCount int64 // track total TCP connections (for optional stats)
 )
-
-func updateWhitelist(ip string) {
-	whitelistedIPsMu.Lock()
-	whitelistedIPs[ip] = true
-	whitelistedIPsMu.Unlock()
-}
 
 func isWhitelisted(ip string) bool {
 	whitelistedIPsMu.RLock()
 	defer whitelistedIPsMu.RUnlock()
 	return whitelistedIPs[ip]
+}
+
+func whitelistIP(ip string) {
+	whitelistedIPsMu.Lock()
+	whitelistedIPs[ip] = true
+	whitelistedIPsMu.Unlock()
+}
+
+func isBanned(ip string) bool {
+	bannedIPsMu.RLock()
+	defer bannedIPsMu.RUnlock()
+	return bannedIPs[ip]
 }
 
 func banIP(ip string) {
@@ -145,24 +157,22 @@ func banIP(ip string) {
 }
 
 // ------------------------
-// Token Bucket Implementation for Rate Limiting
+// Token Bucket
 // ------------------------
 
-type TokenBucket struct {
+type tokenBucket struct {
 	mu         sync.Mutex
 	capacity   float64
 	tokens     float64
-	refillRate float64 // tokens per second
+	refillRate float64
 	lastRefill time.Time
 }
 
-func (tb *TokenBucket) Allow(cost float64) bool {
+func (tb *tokenBucket) allow(cost float64) bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
-
 	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill).Seconds()
-	// Refill tokens based on elapsed time:
 	tb.tokens = math.Min(tb.capacity, tb.tokens+tb.refillRate*elapsed)
 	tb.lastRefill = now
 
@@ -174,336 +184,326 @@ func (tb *TokenBucket) Allow(cost float64) bool {
 }
 
 var (
-	tcpBuckets   = make(map[string]*TokenBucket)
-	tcpBucketsMu sync.RWMutex
-
-	udpBuckets   = make(map[string]*TokenBucket)
+	udpBuckets   = make(map[string]*tokenBucket)
 	udpBucketsMu sync.RWMutex
+
+	tcpBuckets   = make(map[string]*tokenBucket)
+	tcpBucketsMu sync.RWMutex
 )
 
-func getTCPBucket(ip string) *TokenBucket {
-	tcpBucketsMu.RLock()
-	bucket, exists := tcpBuckets[ip]
-	tcpBucketsMu.RUnlock()
-	if !exists {
-		tcpBucketsMu.Lock()
-		bucket, exists = tcpBuckets[ip]
-		if !exists {
-			bucket = &TokenBucket{
-				capacity:   tcpBucketCapacity,
-				tokens:     tcpBucketCapacity,
-				refillRate: tcpBucketRefillRate,
-				lastRefill: time.Now(),
-			}
-			tcpBuckets[ip] = bucket
-		}
-		tcpBucketsMu.Unlock()
-	}
-	return bucket
-}
-
-func getUDPBucket(ip string) *TokenBucket {
+func getUDPTB(ip string) *tokenBucket {
 	udpBucketsMu.RLock()
-	bucket, exists := udpBuckets[ip]
+	tb, ok := udpBuckets[ip]
 	udpBucketsMu.RUnlock()
-	if !exists {
+	if !ok {
 		udpBucketsMu.Lock()
-		bucket, exists = udpBuckets[ip]
-		if !exists {
-			bucket = &TokenBucket{
+		tb, ok = udpBuckets[ip]
+		if !ok {
+			tb = &tokenBucket{
 				capacity:   udpBucketCapacity,
 				tokens:     udpBucketCapacity,
 				refillRate: udpBucketRefillRate,
 				lastRefill: time.Now(),
 			}
-			udpBuckets[ip] = bucket
+			udpBuckets[ip] = tb
 		}
 		udpBucketsMu.Unlock()
 	}
-	return bucket
+	return tb
 }
 
-// Global counters for dropped connections/packets due to rate limiting.
+func getTCPTB(ip string) *tokenBucket {
+	tcpBucketsMu.RLock()
+	tb, ok := tcpBuckets[ip]
+	tcpBucketsMu.RUnlock()
+	if !ok {
+		tcpBucketsMu.Lock()
+		tb, ok = tcpBuckets[ip]
+		if !ok {
+			tb = &tokenBucket{
+				capacity:   tcpBucketCapacity,
+				tokens:     tcpBucketCapacity,
+				refillRate: tcpBucketRefillRate,
+				lastRefill: time.Now(),
+			}
+			tcpBuckets[ip] = tb
+		}
+		tcpBucketsMu.Unlock()
+	}
+	return tb
+}
+
+// ------------------------
+// Concurrency Limits (TCP)
+// ------------------------
+
+var (
+	tcpConnCountByIP   = make(map[string]int)
+	tcpConnCountByIPMu sync.Mutex
+)
+
+// Increase concurrency count for IP. Returns false if above max concurrency.
+func incTCPConn(ip string) bool {
+	tcpConnCountByIPMu.Lock()
+	defer tcpConnCountByIPMu.Unlock()
+	count := tcpConnCountByIP[ip]
+	if count >= maxConcurrentTCPPerIP {
+		return false
+	}
+	tcpConnCountByIP[ip] = count + 1
+	return true
+}
+
+func decTCPConn(ip string) {
+	tcpConnCountByIPMu.Lock()
+	defer tcpConnCountByIPMu.Unlock()
+	count := tcpConnCountByIP[ip]
+	if count > 0 {
+		tcpConnCountByIP[ip] = count - 1
+	}
+}
+
+// ------------------------
+// Drop Counters for DDoS Monitoring
+// ------------------------
 var (
 	tcpDropCount uint64
 	udpDropCount uint64
 )
 
 // ------------------------
-// Handshake Detection Helpers (TCP only)
-// ------------------------
-
-func isTCPHandshake(data []byte) bool {
-	// Basic TLS handshake check
-	return len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 &&
-		(data[2] >= 0x00 && data[2] <= 0x03)
-}
-
-func isFiveMHandshake(data []byte) bool {
-	lower := strings.ToLower(string(data))
-	return strings.Contains(lower, "get /info.json") ||
-		strings.Contains(lower, "get /players.json") ||
-		strings.Contains(lower, "post /client") ||
-		strings.Contains(lower, "citizenfx")
-}
-
-// ------------------------
 // TCP Proxy Logic
 // ------------------------
 
-func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook string) {
-	defer conn.Close()
-	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
+func handleTCPConnection(client net.Conn, targetIP, targetPort, discordWebhook string) {
+	defer client.Close()
+	clientAddr := client.RemoteAddr().(*net.TCPAddr)
+	clientIP := clientAddr.IP.String()
 
-	// Immediately drop if banned.
-	bannedIPsMu.RLock()
-	if bannedIPs[clientIP] {
-		bannedIPsMu.RUnlock()
+	// Banned IP?
+	if isBanned(clientIP) {
 		return
 	}
-	bannedIPsMu.RUnlock()
 
-	// Rate limiting for non-whitelisted IPs:
+	// If not whitelisted, check concurrency limit.
 	if !isWhitelisted(clientIP) {
-		bucket := getTCPBucket(clientIP)
-		if !bucket.Allow(1) {
+		if !incTCPConn(clientIP) {
 			atomic.AddUint64(&tcpDropCount, 1)
-			debugLog("[TCP] [%s] Dropped: Rate limit exceeded", clientIP)
+			debugLog("[TCP] %s concurrency limit reached, dropping connection", clientIP)
+			return
+		}
+		defer decTCPConn(clientIP)
+
+		// Also optional token bucket:
+		tb := getTCPTB(clientIP)
+		if !tb.allow(1) {
+			atomic.AddUint64(&tcpDropCount, 1)
+			debugLog("[TCP] %s token bucket exceeded, dropping connection", clientIP)
 			return
 		}
 	}
 
-	// Read initial handshake data (3s timeout).
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// Minimal handshake read (3s timeout).
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	conn.SetReadDeadline(time.Time{})
+	n, err := client.Read(buf)
+	client.SetReadDeadline(time.Time{})
 	if err != nil || n == 0 {
-		debugLog("[TCP] [%s] Handshake read error: %v", clientIP, err)
+		debugLog("[TCP] %s handshake read error: %v", clientIP, err)
 		return
 	}
 
-	// Validate handshake (TLS or FiveM).
-	if !isTCPHandshake(buf[:n]) && !isFiveMHandshake(buf[:n]) {
-		debugLog("[TCP] [%s] Invalid handshake - banning IP", clientIP)
+	// Basic check: if it looks like TLS or FiveM HTTP, whitelist.
+	if !looksLikeTLS(buf[:n]) && !looksLikeFiveM(buf[:n]) {
+		debugLog("[TCP] %s invalid handshake -> banning IP", clientIP)
 		banIP(clientIP)
 		return
 	}
+	// Whitelist IP so subsequent connections skip concurrency checks.
+	whitelistIP(clientIP)
+	debugLog("[TCP] %s whitelisted (valid handshake)", clientIP)
 
-	// Valid handshake: whitelist the IP so it won't get bucket-limited next time.
-	updateWhitelist(clientIP)
-	atomic.AddInt64(&tcpConnCount, 1)
-	debugLog("[TCP] [%s] Authenticated and whitelisted", clientIP)
-
-	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
+	// Connect to backend
+	backend, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
-		log.Printf("[TCP] [%s] Backend connection error: %v", clientIP, err)
+		log.Printf("[TCP] %s backend dial error: %v", clientIP, err)
 		return
 	}
-	if tcpConn, ok := backendConn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-	defer backendConn.Close()
+	defer backend.Close()
 
-	// Forward handshake data:
-	_, _ = backendConn.Write(buf[:n])
-	proxyTCPWithConn(conn, backendConn, clientIP)
-}
-
-func proxyTCP(client net.Conn, targetIP, targetPort string) {
-	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
-	if err != nil {
-		log.Printf("[TCP] Backend dial error: %v", err)
-		return
-	}
-	if tcpConn, ok := backendConn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-	defer backendConn.Close()
-	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
-}
-
-func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
-	if tcpConn, ok := client.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	// For performance, set keepalive
+	if bc, ok := backend.(*net.TCPConn); ok {
+		bc.SetKeepAlive(true)
+		bc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
+	// Write the handshake data to backend
+	_, _ = backend.Write(buf[:n])
+
+	// Proxy data in both directions
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(backend, client)
-		if err != nil && debugMode {
-			log.Printf("[TCP] [%s] Error copying from client to backend: %v", clientIP, err)
-		}
+		// Larger buffer for less CPU overhead
+		_, _ = io.CopyBuffer(backend, client, make([]byte, 32*1024))
 		backend.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(client, backend)
-		if err != nil && debugMode {
-			log.Printf("[TCP] [%s] Error copying from backend to client: %v", clientIP, err)
-		}
+		_, _ = io.CopyBuffer(client, backend, make([]byte, 32*1024))
 		client.Close()
 	}()
 
 	wg.Wait()
-	debugLog("[TCP] [%s] Connection closed", clientIP)
+	debugLog("[TCP] %s connection closed", clientIP)
+}
+
+func looksLikeTLS(data []byte) bool {
+	return len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 && data[2] <= 0x03
+}
+
+func looksLikeFiveM(data []byte) bool {
+	lower := strings.ToLower(string(data))
+	return strings.Contains(lower, "get /players.json") ||
+		strings.Contains(lower, "get /info.json") ||
+		strings.Contains(lower, "citizenfx") ||
+		strings.Contains(lower, "post /client")
 }
 
 // ------------------------
-// UDP Proxy Logic (No strict handshake check)
+// UDP Proxy Logic
 // ------------------------
 
-type sessionData struct {
+type udpSession struct {
 	clientAddr  *net.UDPAddr
 	backendConn *net.UDPConn
 	lastActive  time.Time
-	closeOnce   sync.Once
 }
 
 var (
-	sessionMap = make(map[string]*sessionData)
-	sessionMu  sync.Mutex
+	udpSessionMap = make(map[string]*udpSession)
+	udpSessionMu  sync.Mutex
 )
 
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
-	listenAddr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
+	la, err := net.ResolveUDPAddr("udp", ":"+listenPort)
 	if err != nil {
-		log.Fatalf("[UDP] Error resolving listen address: %v", err)
+		log.Fatalf("[UDP] resolve listen addr: %v", err)
 	}
-	listenConn, err := net.ListenUDP("udp", listenAddr)
+	listener, err := net.ListenUDP("udp", la)
 	if err != nil {
-		log.Fatalf("[UDP] Error starting UDP listener on port %s: %v", listenPort, err)
+		log.Fatalf("[UDP] listen error on port %s: %v", listenPort, err)
 	}
 	log.Printf("[UDP] Listening on port %s", listenPort)
 
-	backendAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
+	ba, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
-		log.Fatalf("[UDP] Error resolving backend address: %v", err)
+		log.Fatalf("[UDP] resolve backend addr: %v", err)
 	}
 
 	buf := make([]byte, 2048)
 	for {
-		n, clientAddr, err := listenConn.ReadFromUDP(buf)
+		n, caddr, err := listener.ReadFromUDP(buf)
 		if err != nil {
 			continue
 		}
+		clientIP := caddr.IP.String()
 
-		clientIP := clientAddr.IP.String()
-
-		// Immediately drop if banned.
-		bannedIPsMu.RLock()
-		if bannedIPs[clientIP] {
-			bannedIPsMu.RUnlock()
+		// Banned?
+		if isBanned(clientIP) {
 			continue
 		}
-		bannedIPsMu.RUnlock()
 
-		// Apply token bucket if not whitelisted.
+		// If not whitelisted, apply UDP token bucket.
 		if !isWhitelisted(clientIP) {
-			bucket := getUDPBucket(clientIP)
-			if !bucket.Allow(1) {
+			tb := getUDPTB(clientIP)
+			if !tb.allow(1) {
 				atomic.AddUint64(&udpDropCount, 1)
-				debugLog("[UDP] [%s] Dropped packet: Rate limit exceeded", clientAddr.String())
+				debugLog("[UDP] drop from %s (bucket exceeded)", clientIP)
 				continue
 			}
 		}
 
-		// Create or update session
-		clientKey := clientAddr.String()
-		sessionMu.Lock()
-		sd, exists := sessionMap[clientKey]
-		if !exists {
-			backendConn, err := net.DialUDP("udp", nil, backendAddr)
+		// Forward to backend
+		key := caddr.String()
+		udpSessionMu.Lock()
+		sess, ok := udpSessionMap[key]
+		if !ok {
+			bc, err := net.DialUDP("udp", nil, ba)
 			if err != nil {
-				sessionMu.Unlock()
-				debugLog("[UDP] Error dialing backend for client %s: %v", clientKey, err)
+				udpSessionMu.Unlock()
 				continue
 			}
-			sd = &sessionData{
-				clientAddr:  clientAddr,
-				backendConn: backendConn,
+			sess = &udpSession{
+				clientAddr:  caddr,
+				backendConn: bc,
 				lastActive:  time.Now(),
 			}
-			sessionMap[clientKey] = sd
+			udpSessionMap[key] = sess
 
-			// Spin up a goroutine to handle traffic from backend -> client
-			go handleUDPSession(listenConn, sd)
+			// Start read-back loop
+			go handleUDPFromBackend(listener, sess)
 		} else {
-			sd.lastActive = time.Now()
+			sess.lastActive = time.Now()
 		}
-		sessionMu.Unlock()
+		udpSessionMu.Unlock()
 
-		_, err = sd.backendConn.Write(buf[:n])
-		if err != nil && debugMode {
-			log.Printf("[UDP] Write to backend error for client %s: %v", clientKey, err)
-		}
+		_, _ = sess.backendConn.Write(buf[:n])
 	}
 }
 
-func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
+func handleUDPFromBackend(listener *net.UDPConn, sess *udpSession) {
 	buf := make([]byte, 2048)
 	for {
-		sd.backendConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		n, err := sd.backendConn.Read(buf)
+		sess.backendConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := sess.backendConn.Read(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-			debugLog("[UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
+			debugLog("[UDP] backend read error for %s: %v", sess.clientAddr, err)
 			break
 		}
-		sessionMu.Lock()
-		sd.lastActive = time.Now()
-		sessionMu.Unlock()
-
-		_, err = listenConn.WriteToUDP(buf[:n], sd.clientAddr)
-		if err != nil && debugMode {
-			log.Printf("[UDP] Error writing to client %s: %v", sd.clientAddr, err)
-		}
+		sess.lastActive = time.Now()
+		_, _ = listener.WriteToUDP(buf[:n], sess.clientAddr)
 	}
 }
 
 // ------------------------
-// DDoS Drop-Count Monitor
+// DDoS Drop Monitor
 // ------------------------
 
 func monitorDrops(discordWebhook string) {
-	const interval = 10 * time.Second
-	var attackActive bool
-	var consecutiveLow int
-
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		tcpDrops := atomic.LoadUint64(&tcpDropCount)
-		udpDrops := atomic.LoadUint64(&udpDropCount)
-		totalDrops := tcpDrops + udpDrops
+	var attackActive bool
+	var consecutiveBelow int
 
-		// Only log or alert if we cross threshold or if we end an active attack:
-		if totalDrops > dropThreshold {
+	for range ticker.C {
+		td := atomic.LoadUint64(&tcpDropCount)
+		ud := atomic.LoadUint64(&udpDropCount)
+		total := td + ud
+
+		// Only alert if above threshold or if ending an active attack
+		if total > dropThreshold {
 			if !attackActive {
-				sendDDoSAttackStarted(discordWebhook, "Firewall", "", "")
-				log.Printf("[DDoS Alert] Attack detected: drops=%d (> %d)", totalDrops, dropThreshold)
+				sendDDoSAttackStarted(discordWebhook)
+				log.Printf("[DDoS Alert] Attack detected (drops = %d)", total)
 				attackActive = true
 			}
-			consecutiveLow = 0
+			consecutiveBelow = 0
 		} else {
 			if attackActive {
-				consecutiveLow++
-				// Once we've been below threshold for 2 consecutive intervals:
-				if consecutiveLow >= 2 {
-					sendDDoSAttackEnded(discordWebhook, "Firewall", "", "")
-					log.Printf("[DDoS Alert] Attack subsided: drops back below threshold")
+				consecutiveBelow++
+				if consecutiveBelow >= 2 {
+					sendDDoSAttackEnded(discordWebhook)
+					log.Printf("[DDoS Alert] Attack subsided")
 					attackActive = false
-					consecutiveLow = 0
+					consecutiveBelow = 0
 				}
 			}
 		}
@@ -511,33 +511,37 @@ func monitorDrops(discordWebhook string) {
 		// Reset counters
 		atomic.StoreUint64(&tcpDropCount, 0)
 		atomic.StoreUint64(&udpDropCount, 0)
+
+		// Optional: log current goroutine count to see CPU usage over time
+		if debugMode {
+			log.Printf("[DEBUG] Goroutines: %d", runtime.NumGoroutine())
+		}
 	}
 }
 
 // ------------------------
-// Main Function
+// Main
 // ------------------------
 
 func main() {
-	targetIP := flag.String("targetIP", "", "Backend server IP address")
+	targetIP := flag.String("targetIP", "", "Backend server IP")
 	targetPort := flag.String("targetPort", "", "Backend server port")
-	listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
-	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL for alerts (optional)")
+	listenPort := flag.String("listenPort", "", "Proxy listen port (TCP & UDP)")
+	discordWebhook := flag.String("discordWebhook", "", "Discord webhook URL (optional)")
 	flag.Parse()
 
 	if *targetIP == "" || *targetPort == "" || *listenPort == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=<IP> -targetPort=<port> -listenPort=<port> [-discordWebhook=<url>]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s -targetIP=IP -targetPort=PORT -listenPort=PORT [-discordWebhook=URL]\n", os.Args[0])
 		os.Exit(1)
 	}
 
-	log.Printf("[INFO] Starting enhanced firewall proxy: forwarding to %s:%s on port %s",
-		*targetIP, *targetPort, *listenPort)
+	log.Printf("[INFO] Starting firewall proxy -> %s:%s on port %s", *targetIP, *targetPort, *listenPort)
 
-	// Start TCP proxy listener
+	// Start TCP
 	go func() {
 		ln, err := net.Listen("tcp", ":"+*listenPort)
 		if err != nil {
-			log.Fatalf("[TCP] Listen error on port %s: %v", *listenPort, err)
+			log.Fatalf("[TCP] Listen error on %s: %v", *listenPort, err)
 		}
 		defer ln.Close()
 		log.Printf("[TCP] Listening on port %s", *listenPort)
@@ -554,10 +558,10 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy listener
+	// Start UDP
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
-	// Start global DDoS monitor
+	// Start drop monitor
 	go monitorDrops(*discordWebhook)
 
 	// Block forever
