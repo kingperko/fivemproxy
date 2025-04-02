@@ -20,6 +20,12 @@ import (
 // Discord Notification Support
 // ------------------------
 
+// Set this to true to disable Discord notifications (for now).
+const disableDiscord = true
+
+// Added flag to disable UDP handshake check.
+const disableUDPHandshakeCheck = true
+
 // discordEmbed defines the structure of a Discord embed.
 type discordEmbed struct {
 	Title       string `json:"title,omitempty"`
@@ -34,7 +40,11 @@ type discordWebhookBody struct {
 }
 
 // sendDiscordEmbed sends a Discord embed message to the given webhook URL.
+// Currently disabled until a later update.
 func sendDiscordEmbed(webhookURL, title, description string, color int) {
+	if disableDiscord {
+		return
+	}
 	if webhookURL == "" {
 		return
 	}
@@ -142,12 +152,17 @@ var (
 // Handshake Detection
 // ------------------------
 
-func isLegitHandshake(data []byte) bool {
-	// (This function is kept for TCP; for UDP we now whitelist directly.)
+// isTCPHandshake checks for a basic TLS handshake header.
+func isTCPHandshake(data []byte) bool {
 	if len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 &&
 		(data[2] >= 0x00 && data[2] <= 0x03) {
 		return true
 	}
+	return false
+}
+
+// isFiveMHandshake checks for known FiveM GET/POST patterns.
+func isFiveMHandshake(data []byte) bool {
 	lower := strings.ToLower(string(data))
 	if strings.Contains(lower, "get /info.json") ||
 		strings.Contains(lower, "get /players.json") ||
@@ -179,6 +194,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
+	// Minimal handshake check for new IP
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
@@ -189,15 +205,18 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	if !isLegitHandshake(buf[:n]) {
+	// Must pass either the TLS handshake check or known FiveM patterns
+	if !isTCPHandshake(buf[:n]) && !isFiveMHandshake(buf[:n]) {
 		log.Printf(">> [TCP] [%s] Dropped - Invalid handshake", clientIP)
 		banIP(clientIP)
 		return
 	}
 
+	// Good handshake => whitelist
 	updateWhitelist(clientIP)
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf(">> [TCP] [%s] Authenticated and whitelisted", clientIP)
+
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf(">> [TCP] [%s] Backend connection error: %v", clientIP, err)
@@ -205,6 +224,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	defer backendConn.Close()
 
+	// Forward the handshake data
 	backendConn.Write(buf[:n])
 	proxyTCPWithConn(conn, backendConn, clientIP)
 }
@@ -219,22 +239,47 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	proxyTCPWithConn(client, backendConn, client.RemoteAddr().String())
 }
 
+// Updated function: Waits for both directions to finish and uses CloseWrite for graceful shutdown.
 func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	
+	// Copy from client to backend.
 	go func() {
-		io.Copy(backend, client)
-		done <- struct{}{}
+		defer wg.Done()
+		_, err := io.Copy(backend, client)
+		if err != nil {
+			log.Printf(">> [TCP] Error copying from client to backend: %v", err)
+		}
+		// Gracefully close the write side of the backend connection.
+		if tcpConn, ok := backend.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		} else {
+			backend.Close()
+		}
 	}()
+	
+	// Copy from backend to client.
 	go func() {
-		io.Copy(client, backend)
-		done <- struct{}{}
+		defer wg.Done()
+		_, err := io.Copy(client, backend)
+		if err != nil {
+			log.Printf(">> [TCP] Error copying from backend to client: %v", err)
+		}
+		// Gracefully close the write side of the client connection.
+		if tcpConn, ok := client.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		} else {
+			client.Close()
+		}
 	}()
-	<-done
+	
+	wg.Wait()
 	log.Printf(">> [TCP] [%s] Connection closed", clientIP)
 }
 
 // ------------------------
-// UDP Proxy Logic (Persistent Sessions)
+// UDP Proxy Logic (Persistent Sessions with Handshake Check)
 // ------------------------
 
 type sessionData struct {
@@ -245,12 +290,29 @@ type sessionData struct {
 }
 
 var (
-	// Keep legitimate sessions active for up to 600 seconds.
 	sessionMap   = make(map[string]*sessionData)
 	sessionMu    sync.Mutex
 	cleanupTimer = 30 * time.Second  // Frequency to check for idle sessions
 	sessionTTL   = 600 * time.Second // Idle timeout duration (10 minutes)
 )
+
+// For UDP handshake tracking.
+var (
+	udpHandshakeChecked   = make(map[string]bool)
+	udpHandshakeCheckedMu sync.Mutex
+)
+
+func hasCheckedHandshake(ip string) bool {
+	udpHandshakeCheckedMu.Lock()
+	defer udpHandshakeCheckedMu.Unlock()
+	return udpHandshakeChecked[ip]
+}
+
+func markHandshakeChecked(ip string) {
+	udpHandshakeCheckedMu.Lock()
+	udpHandshakeChecked[ip] = true
+	udpHandshakeCheckedMu.Unlock()
+}
 
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	listenAddr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
@@ -268,9 +330,8 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		log.Fatalf(">> [UDP] Error resolving backend address: %v", err)
 	}
 
-	// Start DDoS monitoring.
+	// Start DDoS monitoring and session cleanup.
 	go monitorDDoS(discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", targetIP, listenPort), targetPort)
-	// Start session cleanup.
 	go cleanupSessions()
 
 	buf := make([]byte, 2048)
@@ -295,13 +356,27 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// Instead of a handshake check, whitelist any new client.
-		if !isWhitelisted(clientIP) {
+		// If handshake check is not disabled, then perform handshake check for new IP.
+		if !isWhitelisted(clientIP) && !hasCheckedHandshake(clientIP) {
+			if !disableUDPHandshakeCheck {
+				if !isFiveMHandshake(buf[:n]) {
+					log.Printf(">> [UDP] [%s] Dropped - invalid handshake, banning IP", clientIP)
+					banIP(clientIP)
+					continue
+				}
+			}
+			// Either handshake check is disabled or it passed.
+			log.Printf(">> [UDP] [%s] Authenticated handshake (or bypassed) => whitelisted", clientIP)
 			updateWhitelist(clientIP)
-			log.Printf(">> [UDP] [%s] Whitelisted", clientIP)
+			markHandshakeChecked(clientIP)
+		} else if !isWhitelisted(clientIP) {
+			// If we've already checked handshake but not whitelisted, ban (unlikely case)
+			log.Printf(">> [UDP] [%s] No handshake pass => ban", clientIP)
+			banIP(clientIP)
+			continue
 		}
 
-		// Update or create persistent session.
+		// Normal flow: IP is whitelisted.
 		sessionMu.Lock()
 		sd, exists := sessionMap[clientAddr.String()]
 		if !exists {
@@ -319,7 +394,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			sessionMap[clientAddr.String()] = sd
 			go handleUDPSession(listenConn, sd)
 		} else {
-			// Update lastActive on each packet.
 			sd.lastActive = time.Now()
 		}
 		sessionMu.Unlock()
@@ -344,7 +418,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 			log.Printf(">> [UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
 			break
 		}
-		// Update lastActive on receiving any backend data.
+		// Update lastActive on receiving backend data.
 		sessionMu.Lock()
 		sd.lastActive = time.Now()
 		sessionMu.Unlock()
@@ -397,7 +471,7 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 	var peakMbps float64
 	var belowCount int
 
-	// Set thresholds for attack detection.
+	// Set thresholds (adjust these as needed).
 	const ppsThreshold = 1000 // packets per second threshold
 	const mbpsThreshold = 1.0 // Mbps threshold
 
@@ -444,17 +518,6 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 }
 
 // ------------------------
-// Utility Functions
-// ------------------------
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// ------------------------
 // Main Function
 // ------------------------
 
@@ -490,10 +553,10 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy in a goroutine.
+	// Start UDP proxy in a separate goroutine.
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
-	// Start DDoS monitoring.
+	// Start DDoS monitoring in its own goroutine.
 	go monitorDDoS(*discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", *targetIP, *listenPort), *targetPort)
 
 	// Block forever.
