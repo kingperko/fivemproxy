@@ -18,10 +18,30 @@ import (
 )
 
 // ------------------------
-// Discord Notification Support
+// Configuration
 // ------------------------
 
-const disableDiscord = false // Set to false to enable Discord notifications.
+// If you want more detailed logging (for debugging), set this to true.
+const debugMode = false
+
+// For Discord notifications (set to false if you do not want them at all).
+const disableDiscord = false
+
+// Adjust these to tune rate limiting:
+const (
+	tcpBucketCapacity   = 20.0 // Maximum tokens per IP for TCP connections
+	tcpBucketRefillRate = 2.0  // Tokens per second refill for TCP
+
+	udpBucketCapacity   = 50.0 // Maximum tokens per IP for UDP packets
+	udpBucketRefillRate = 10.0 // Tokens per second refill for UDP
+)
+
+// DDoS drop threshold per interval (10s) for sending an alert.
+const dropThreshold = 200
+
+// ------------------------
+// Discord Notification Support
+// ------------------------
 
 type discordEmbed struct {
 	Title       string `json:"title,omitempty"`
@@ -83,6 +103,16 @@ func sendDDoSAttackEnded(webhookURL, serverName, serverIP, targetPort string) {
 }
 
 // ------------------------
+// Logging Helpers
+// ------------------------
+
+func debugLog(format string, v ...interface{}) {
+	if debugMode {
+		log.Printf(format, v...)
+	}
+}
+
+// ------------------------
 // Global Firewall Variables & Helpers
 // ------------------------
 
@@ -93,7 +123,7 @@ var (
 	bannedIPs   = make(map[string]bool)
 	bannedIPsMu sync.RWMutex
 
-	tcpConnCount int64
+	tcpConnCount int64 // track total TCP connections (for optional stats)
 )
 
 func updateWhitelist(ip string) {
@@ -129,6 +159,7 @@ type TokenBucket struct {
 func (tb *TokenBucket) Allow(cost float64) bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
+
 	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill).Seconds()
 	// Refill tokens based on elapsed time:
@@ -141,14 +172,6 @@ func (tb *TokenBucket) Allow(cost float64) bool {
 	}
 	return false
 }
-
-const (
-	tcpBucketCapacity   = 20.0 // max tokens for TCP
-	tcpBucketRefillRate = 2.0  // tokens per second for TCP
-
-	udpBucketCapacity   = 50.0 // max tokens for UDP
-	udpBucketRefillRate = 10.0 // tokens per second for UDP
-)
 
 var (
 	tcpBuckets   = make(map[string]*TokenBucket)
@@ -209,11 +232,9 @@ var (
 // ------------------------
 // Handshake Detection Helpers (TCP only)
 // ------------------------
-// You can keep these for TCP handshake checks if you like. 
-// We won't enforce them on UDP in this updated version.
 
 func isTCPHandshake(data []byte) bool {
-	// Check for basic TLS handshake bytes
+	// Basic TLS handshake check
 	return len(data) >= 3 && data[0] == 0x16 && data[1] == 0x03 &&
 		(data[2] >= 0x00 && data[2] <= 0x03)
 }
@@ -227,14 +248,14 @@ func isFiveMHandshake(data []byte) bool {
 }
 
 // ------------------------
-// TCP Proxy Logic with Token Bucket Rate Limiting
+// TCP Proxy Logic
 // ------------------------
 
 func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook string) {
 	defer conn.Close()
 	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 
-	// Immediately drop if the IP is banned.
+	// Immediately drop if banned.
 	bannedIPsMu.RLock()
 	if bannedIPs[clientIP] {
 		bannedIPsMu.RUnlock()
@@ -242,12 +263,12 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	bannedIPsMu.RUnlock()
 
-	// For non-whitelisted clients, use token bucket rate limiting.
+	// Rate limiting for non-whitelisted IPs:
 	if !isWhitelisted(clientIP) {
 		bucket := getTCPBucket(clientIP)
 		if !bucket.Allow(1) {
 			atomic.AddUint64(&tcpDropCount, 1)
-			log.Printf("[TCP] [%s] Dropped: Rate limit exceeded", clientIP)
+			debugLog("[TCP] [%s] Dropped: Rate limit exceeded", clientIP)
 			return
 		}
 	}
@@ -258,21 +279,21 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	n, err := conn.Read(buf)
 	conn.SetReadDeadline(time.Time{})
 	if err != nil || n == 0 {
-		log.Printf("[TCP] [%s] Handshake read error: %v", clientIP, err)
+		debugLog("[TCP] [%s] Handshake read error: %v", clientIP, err)
 		return
 	}
 
 	// Validate handshake (TLS or FiveM).
 	if !isTCPHandshake(buf[:n]) && !isFiveMHandshake(buf[:n]) {
-		log.Printf("[TCP] [%s] Invalid handshake - banning IP", clientIP)
+		debugLog("[TCP] [%s] Invalid handshake - banning IP", clientIP)
 		banIP(clientIP)
 		return
 	}
 
-	// Valid handshake: whitelist the IP.
+	// Valid handshake: whitelist the IP so it won't get bucket-limited next time.
 	updateWhitelist(clientIP)
 	atomic.AddInt64(&tcpConnCount, 1)
-	log.Printf("[TCP] [%s] Authenticated and whitelisted", clientIP)
+	debugLog("[TCP] [%s] Authenticated and whitelisted", clientIP)
 
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -285,7 +306,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	defer backendConn.Close()
 
-	// Forward the handshake data to the backend.
+	// Forward handshake data:
 	_, _ = backendConn.Write(buf[:n])
 	proxyTCPWithConn(conn, backendConn, clientIP)
 }
@@ -316,7 +337,7 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	go func() {
 		defer wg.Done()
 		_, err := io.Copy(backend, client)
-		if err != nil {
+		if err != nil && debugMode {
 			log.Printf("[TCP] [%s] Error copying from client to backend: %v", clientIP, err)
 		}
 		backend.Close()
@@ -325,24 +346,19 @@ func proxyTCPWithConn(client, backend net.Conn, clientIP string) {
 	go func() {
 		defer wg.Done()
 		_, err := io.Copy(client, backend)
-		if err != nil {
+		if err != nil && debugMode {
 			log.Printf("[TCP] [%s] Error copying from backend to client: %v", clientIP, err)
 		}
 		client.Close()
 	}()
 
 	wg.Wait()
-	log.Printf("[TCP] [%s] Connection closed", clientIP)
+	debugLog("[TCP] [%s] Connection closed", clientIP)
 }
 
 // ------------------------
-// UDP Proxy Logic WITHOUT strict handshake check
+// UDP Proxy Logic (No strict handshake check)
 // ------------------------
-// Instead of requiring a FiveM handshake, we rely on:
-//   1) The token bucket for rate limiting
-//   2) If an IP is already whitelisted via TCP, skip bucket checks
-//   3) If an IP isn't whitelisted, we still allow the packet (so normal servers can talk back)
-//      but apply the token bucket cost. If the IP floods, it gets dropped by the bucket.
 
 type sessionData struct {
 	clientAddr  *net.UDPAddr
@@ -381,26 +397,23 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 
 		clientIP := clientAddr.IP.String()
 
+		// Immediately drop if banned.
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
-			// Immediately drop if banned
 			continue
 		}
 		bannedIPsMu.RUnlock()
 
-		// Token bucket for non-whitelisted IP
+		// Apply token bucket if not whitelisted.
 		if !isWhitelisted(clientIP) {
 			bucket := getUDPBucket(clientIP)
 			if !bucket.Allow(1) {
 				atomic.AddUint64(&udpDropCount, 1)
-				log.Printf("[UDP] [%s] Dropped packet: Rate limit exceeded", clientAddr.String())
+				debugLog("[UDP] [%s] Dropped packet: Rate limit exceeded", clientAddr.String())
 				continue
 			}
 		}
-
-		// If desired, you could keep some minimal handshake check here.
-		// For now, we let all UDP traffic pass as long as the bucket allows it.
 
 		// Create or update session
 		clientKey := clientAddr.String()
@@ -410,7 +423,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			backendConn, err := net.DialUDP("udp", nil, backendAddr)
 			if err != nil {
 				sessionMu.Unlock()
-				log.Printf("[UDP] Error dialing backend for client %s: %v", clientKey, err)
+				debugLog("[UDP] Error dialing backend for client %s: %v", clientKey, err)
 				continue
 			}
 			sd = &sessionData{
@@ -420,7 +433,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			}
 			sessionMap[clientKey] = sd
 
-			// Spin up a goroutine to handle traffic from the backend -> client
+			// Spin up a goroutine to handle traffic from backend -> client
 			go handleUDPSession(listenConn, sd)
 		} else {
 			sd.lastActive = time.Now()
@@ -428,9 +441,8 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		sessionMu.Unlock()
 
 		_, err = sd.backendConn.Write(buf[:n])
-		if err != nil {
+		if err != nil && debugMode {
 			log.Printf("[UDP] Write to backend error for client %s: %v", clientKey, err)
-			continue
 		}
 	}
 }
@@ -444,7 +456,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-			log.Printf("[UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
+			debugLog("[UDP] Error reading from backend for client %s: %v", sd.clientAddr, err)
 			break
 		}
 		sessionMu.Lock()
@@ -452,19 +464,18 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 		sessionMu.Unlock()
 
 		_, err = listenConn.WriteToUDP(buf[:n], sd.clientAddr)
-		if err != nil {
+		if err != nil && debugMode {
 			log.Printf("[UDP] Error writing to client %s: %v", sd.clientAddr, err)
 		}
 	}
 }
 
 // ------------------------
-// Drop-Count-Based DDoS Monitor
+// DDoS Drop-Count Monitor
 // ------------------------
 
 func monitorDrops(discordWebhook string) {
 	const interval = 10 * time.Second
-	const dropThreshold = 200
 	var attackActive bool
 	var consecutiveLow int
 
@@ -476,26 +487,28 @@ func monitorDrops(discordWebhook string) {
 		udpDrops := atomic.LoadUint64(&udpDropCount)
 		totalDrops := tcpDrops + udpDrops
 
-		log.Printf("[DDoS Monitor] Total drops in last %v: %d", interval, totalDrops)
-
+		// Only log or alert if we cross threshold or if we end an active attack:
 		if totalDrops > dropThreshold {
 			if !attackActive {
 				sendDDoSAttackStarted(discordWebhook, "Firewall", "", "")
-				log.Printf("[DDoS Alert] Attack detected: Total drops (%d) exceeded threshold (%d)", totalDrops, dropThreshold)
+				log.Printf("[DDoS Alert] Attack detected: drops=%d (> %d)", totalDrops, dropThreshold)
 				attackActive = true
 			}
 			consecutiveLow = 0
 		} else {
 			if attackActive {
 				consecutiveLow++
+				// Once we've been below threshold for 2 consecutive intervals:
 				if consecutiveLow >= 2 {
 					sendDDoSAttackEnded(discordWebhook, "Firewall", "", "")
-					log.Printf("[DDoS Alert] Attack subsided: Drops below threshold for %d intervals", consecutiveLow)
+					log.Printf("[DDoS Alert] Attack subsided: drops back below threshold")
 					attackActive = false
 					consecutiveLow = 0
 				}
 			}
 		}
+
+		// Reset counters
 		atomic.StoreUint64(&tcpDropCount, 0)
 		atomic.StoreUint64(&udpDropCount, 0)
 	}
@@ -528,10 +541,13 @@ func main() {
 		}
 		defer ln.Close()
 		log.Printf("[TCP] Listening on port %s", *listenPort)
+
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				log.Printf("[TCP] Accept error: %v", err)
+				if debugMode {
+					log.Printf("[TCP] Accept error: %v", err)
+				}
 				continue
 			}
 			go handleTCPConnection(conn, *targetIP, *targetPort, *discordWebhook)
@@ -541,7 +557,7 @@ func main() {
 	// Start UDP proxy listener
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
-	// Start global DDoS monitor based on drop counts
+	// Start global DDoS monitor
 	go monitorDrops(*discordWebhook)
 
 	// Block forever
