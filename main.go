@@ -80,8 +80,8 @@ func sendDiscordEmbed(webhookURL, title, description string, color int) {
 // ------------------------
 
 var (
-	tcpConnCount   int64 // counts TCP connections in current interval
-	udpPacketCount int64 // counts UDP packets in current interval
+	tcpConnCount   int64    // counts TCP connections in current interval
+	udpPacketCount int64    // counts UDP packets in current interval
 	uniqueIPs      sync.Map // map[string]bool of client IPs seen in current interval
 
 	attackMode      bool
@@ -90,26 +90,24 @@ var (
 	consecutiveSafe int   // number of consecutive intervals below threshold
 )
 
-// threshold: if total events exceed this in a 5-second window, consider it an attack.
-const thresholdEvents int64 = 100
+// Increase threshold to allow normal FiveM traffic.
+const thresholdEvents int64 = 1000
 
 // monitorAttack runs every 5 seconds to check event counts.
 func monitorAttack(discordWebhook string) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		// Read and reset counters atomically.
+		// Atomically read and reset counters.
 		tcp := atomic.SwapInt64(&tcpConnCount, 0)
 		udp := atomic.SwapInt64(&udpPacketCount, 0)
 		total := tcp + udp
 
-		// Count unique IPs.
 		uniqueCount := 0
 		uniqueIPs.Range(func(key, value interface{}) bool {
 			uniqueCount++
 			return true
 		})
-		// Clear unique IPs for next interval.
 		uniqueIPs = sync.Map{}
 
 		log.Printf("=== Interval Summary ===")
@@ -133,7 +131,6 @@ func monitorAttack(discordWebhook string) {
 			} else {
 				consecutiveSafe = 0
 			}
-			// If safe for 2 intervals, consider attack over.
 			if consecutiveSafe >= 2 {
 				attackMode = false
 				msg := fmt.Sprintf("Attack ended.\nPeak events in an interval: %d\nUnique IPs (last interval): %d", peakEvents, uniqueCount)
@@ -167,14 +164,12 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	}
 	defer backend.Close()
 
-	// Attempt to read an initial packet for logging without forcing timeout termination.
+	// Attempt to read an initial packet for logging without forcing termination.
 	client.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1024)
 	n, err := client.Read(buf)
-	// Clear deadline regardless of error.
-	client.SetReadDeadline(time.Time{})
+	client.SetReadDeadline(time.Time{}) // clear deadline
 	if err != nil {
-		// If the error is a timeout, it's not fatal—just log it.
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			log.Printf("[TCP] No initial packet received from %s (timeout)", clientAddr)
 		} else if err != io.EOF {
@@ -186,7 +181,7 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 		_, _ = backend.Write(buf[:n])
 	}
 
-	// Start bidirectional copy.
+	// Bidirectional copy.
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(backend, client)
@@ -298,7 +293,6 @@ func startUDPProxy(listenPort, targetIP, targetPort string) {
 // ------------------------
 
 func main() {
-	// Parse command-line flags.
 	targetIP := flag.String("targetIP", "", "Backend server IP address")
 	targetPort := flag.String("targetPort", "", "Backend server port")
 	listenPort := flag.String("listenPort", "", "Port on which the proxy listens for both TCP and UDP")
@@ -310,10 +304,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start attack monitoring in the background.
 	go monitorAttack(*discordWebhook)
-
-	// Start both TCP and UDP proxies on the same port concurrently.
 	go startTCPProxy(*listenPort, *targetIP, *targetPort)
 	startUDPProxy(*listenPort, *targetIP, *targetPort)
 }
