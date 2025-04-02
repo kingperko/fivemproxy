@@ -164,11 +164,11 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 	}
 	defer backend.Close()
 
-	// Attempt to read an initial packet for logging without forcing termination.
+	// Attempt to read an initial packet for logging without forcing closure.
 	client.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1024)
 	n, err := client.Read(buf)
-	client.SetReadDeadline(time.Time{}) // clear deadline
+	client.SetReadDeadline(time.Time{}) // Clear deadline
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			log.Printf("[TCP] No initial packet received from %s (timeout)", clientAddr)
@@ -181,17 +181,33 @@ func handleTCPConnection(client net.Conn, targetIP, targetPort string) {
 		_, _ = backend.Write(buf[:n])
 	}
 
-	// Bidirectional copy.
-	done := make(chan struct{}, 2)
+	// Use WaitGroup to handle bidirectional copying.
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Copy from client to backend.
 	go func() {
-		io.Copy(backend, client)
-		done <- struct{}{}
+		defer wg.Done()
+		_, _ = io.Copy(backend, client)
+		if tcpBackend, ok := backend.(*net.TCPConn); ok {
+			tcpBackend.CloseWrite()
+		} else {
+			backend.Close()
+		}
 	}()
+
+	// Copy from backend to client.
 	go func() {
-		io.Copy(client, backend)
-		done <- struct{}{}
+		defer wg.Done()
+		_, _ = io.Copy(client, backend)
+		if tcpClient, ok := client.(*net.TCPConn); ok {
+			tcpClient.CloseWrite()
+		} else {
+			client.Close()
+		}
 	}()
-	<-done
+
+	wg.Wait()
 	log.Printf("[TCP] Connection from %s closed after %v", clientAddr, time.Since(startTime))
 }
 
