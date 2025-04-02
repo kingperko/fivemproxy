@@ -96,7 +96,7 @@ var (
 	tcpConnCount int64
 )
 
-// trustedIPs holds IPs that are always allowed.
+// trustedIPs holds IPs that must always be allowed.
 var (
 	trustedIPs   = make(map[string]bool)
 	trustedIPsMu sync.RWMutex
@@ -118,7 +118,7 @@ func addTrustedIPs(ips []string) {
 	}
 }
 
-// Tracks if we are under DDoS
+// Tracks if we are under DDoS.
 var (
 	ddosAttackActive bool
 	ddosMutex        sync.RWMutex
@@ -274,6 +274,12 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
+	// If under active DDoS, block non-trusted IPs.
+	if isDDoSActive() && !isTrusted(clientIP) {
+		log.Printf("[TCP] [%s] Blocked: DDoS active and IP is not trusted.", clientIP)
+		return
+	}
+
 	// Immediately drop if banned.
 	bannedIPsMu.RLock()
 	if bannedIPs[clientIP] {
@@ -296,20 +302,14 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	connectionRatesMu.Unlock()
 
-	// If already whitelisted, skip handshake logic.
+	// If already whitelisted, allow connection.
 	if isWhitelisted(clientIP) {
 		log.Printf("[TCP] [%s] Whitelisted => connection allowed.", clientIP)
 		proxyTCP(conn, targetIP, targetPort)
 		return
 	}
 
-	// If under active DDoS, block new IP.
-	if isDDoSActive() {
-		log.Printf("[TCP] [%s] Blocked: DDoS active, new IP not whitelisted.", clientIP)
-		return
-	}
-
-	// PHASE 1: Basic handshake read.
+	// PHASE 1: Read handshake data.
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
@@ -326,7 +326,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Must be either a recognized FiveM handshake or a TLS handshake.
+	// Verify handshake.
 	if !isFiveMHandshake(buf[:n]) && !isTLSHandshake(buf[:n]) {
 		tcpHandshakeFailuresMu.Lock()
 		tcpHandshakeFailures[clientIP]++
@@ -339,7 +339,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// PHASE 2: Forward handshake to backend and wait for initial response.
+	// PHASE 2: Forward handshake to backend and wait for response.
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf("[TCP] [%s] Backend dial error: %v", clientIP, err)
@@ -350,48 +350,41 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// Send handshake data to backend.
 	_, err = backendConn.Write(buf[:n])
 	if err != nil {
-		log.Printf("[TCP] [%s] Error forwarding handshake to backend: %v", clientIP, err)
+		log.Printf("[TCP] [%s] Error forwarding handshake: %v", clientIP, err)
 		backendConn.Close()
 		return
 	}
 
-	// Wait for backend's initial response (7s timeout).
 	backendConn.SetReadDeadline(time.Now().Add(7 * time.Second))
 	respBuf := make([]byte, 4096)
 	rn, rerr := backendConn.Read(respBuf)
 	backendConn.SetReadDeadline(time.Time{})
 	if rerr != nil || rn < 10 {
-		log.Printf("[TCP] [%s] Backend response too short or error (rn: %d, err: %v) => banning IP.", clientIP, rn, rerr)
+		log.Printf("[TCP] [%s] Backend response too short/error (rn: %d, err: %v) => banning IP.", clientIP, rn, rerr)
 		banIP(clientIP)
 		backendConn.Close()
 		return
 	}
 
-	// Finalize whitelisting.
 	updateWhitelist(clientIP)
 	atomic.AddInt64(&tcpConnCount, 1)
 	log.Printf("[TCP] [%s] Authenticated => whitelisted (phase 2).", clientIP)
 
-	// Forward backend's response to the client.
 	_, _ = conn.Write(respBuf[:rn])
 
-	// Bridge remaining traffic.
+	// Bridge traffic.
 	go func() {
 		defer backendConn.Close()
 		_, err := io.Copy(backendConn, conn)
 		logTCPError("copying from client to backend", err)
 	}()
-
 	go func() {
 		defer conn.Close()
 		_, err := io.Copy(conn, backendConn)
 		logTCPError("copying from backend to client", err)
 	}()
-
-	// Block until connection closes.
 	select {}
 }
 
@@ -409,19 +402,16 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	go func() {
 		defer wg.Done()
 		io.Copy(backendConn, client)
 		backendConn.Close()
 	}()
-
 	go func() {
 		defer wg.Done()
 		io.Copy(client, backendConn)
 		client.Close()
 	}()
-
 	wg.Wait()
 }
 
@@ -429,9 +419,8 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 // Two-Phase UDP Proxy Logic
 // ------------------------
 //
-// For UDP, if the IP is already whitelisted, packets are forwarded immediately.
-// For new IPs, we attempt a mini two-phase handshake: forward the packet to backend,
-// wait for up to 3 seconds for a response, and if a valid response is received, whitelist the IP.
+// For UDP, if the IP is trusted or already whitelisted, forward immediately.
+// Otherwise, if DDoS is active and the IP is not trusted, block new UDP packets.
 type sessionDataUDP struct {
 	clientAddr  *net.UDPAddr
 	backendConn *net.UDPConn
@@ -441,7 +430,6 @@ type sessionDataUDP struct {
 var (
 	sessionMapUDP = make(map[string]*sessionDataUDP)
 	sessionMuUDP  sync.Mutex
-
 	udpHandshakeChecked   = make(map[string]bool)
 	udpHandshakeCheckedMu sync.Mutex
 )
@@ -482,12 +470,17 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		atomic.AddUint64(&ddosPacketCount, 1)
 		atomic.AddUint64(&ddosByteCount, uint64(n))
-
 		clientIP := clientAddr.IP.String()
 
 		// Trusted IPs bypass UDP checks.
 		if isTrusted(clientIP) {
 			forwardUDP(listenConn, backendAddr, clientAddr, buf[:n])
+			continue
+		}
+
+		// If under DDoS and not trusted, block.
+		if isDDoSActive() && !isTrusted(clientIP) {
+			log.Printf("[UDP] [%s] Blocked: DDoS active and IP is not trusted.", clientAddr.String())
 			continue
 		}
 
@@ -499,19 +492,13 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// Already whitelisted => forward UDP immediately.
+		// If already whitelisted, forward immediately.
 		if isWhitelisted(clientIP) {
 			forwardUDP(listenConn, backendAddr, clientAddr, buf[:n])
 			continue
 		}
 
-		// If under attack, block new IP.
-		if isDDoSActive() {
-			log.Printf("[UDP] [%s] Blocked: DDoS active, new IP not whitelisted.", clientAddr.String())
-			continue
-		}
-
-		// If we haven't done a handshake check yet, attempt UDP two-phase handshake.
+		// Attempt a two-phase UDP handshake for new IPs.
 		if !hasUDPCheckedHandshake(clientAddr.String()) {
 			if !disableUDPHandshakeCheck {
 				if !isFiveMHandshake(buf[:n]) {
@@ -532,11 +519,9 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 				log.Printf("[UDP] [%s] Error dialing backend: %v", clientAddr.String(), err)
 				continue
 			}
-
-			// Send the initial packet to backend.
 			_, werr := backendConn.Write(buf[:n])
 			if werr != nil {
-				log.Printf("[UDP] [%s] Error forwarding handshake to backend: %v", clientAddr.String(), werr)
+				log.Printf("[UDP] [%s] Error forwarding handshake: %v", clientAddr.String(), werr)
 				backendConn.Close()
 				continue
 			}
@@ -545,9 +530,8 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			respBuf := make([]byte, 2048)
 			rn, rerr := backendConn.Read(respBuf)
 			backendConn.SetReadDeadline(time.Time{})
-
 			if rerr != nil || rn < 1 {
-				log.Printf("[UDP] [%s] No backend response => banning IP.", clientAddr.String())
+				log.Printf("[UDP] [%s] No valid backend response => banning IP.", clientAddr.String())
 				banIP(clientIP)
 				backendConn.Close()
 				continue
@@ -569,8 +553,8 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			go handleUDPSession(listenConn, sd)
 			continue
 		} else {
-			// If handshake check was done but not whitelisted, ban.
-			log.Printf("[UDP] [%s] Already handshake-checked => banning.", clientAddr.String())
+			// Already handshake-checked but not whitelisted => ban.
+			log.Printf("[UDP] [%s] Already handshake-checked but not whitelisted => banning.", clientAddr.String())
 			banIP(clientIP)
 			continue
 		}
@@ -621,6 +605,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionDataUDP) {
 		sessionMuUDP.Lock()
 		sd.lastActive = time.Now()
 		sessionMuUDP.Unlock()
+
 		_, err = listenConn.WriteToUDP(buf[:n], sd.clientAddr)
 		if err != nil {
 			log.Printf("[UDP] Error writing to client %s: %v", sd.clientAddr, err)
@@ -718,7 +703,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Parse trusted IPs, if provided.
 	if *trustedIPsFlag != "" {
 		ips := strings.Split(*trustedIPsFlag, ",")
 		addTrustedIPs(ips)
@@ -747,10 +731,10 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy with two-phase approach
+	// Start UDP proxy with two-phase approach.
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
-	// Start DDoS detection
+	// Start DDoS detection.
 	go monitorDDoS(*discordWebhook, "FiveGate", fmt.Sprintf("%s:%s", *targetIP, *listenPort), *targetPort)
 
 	select {}
