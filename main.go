@@ -328,7 +328,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Wait for backend's initial response.
+	// Wait for backend's initial response (7s timeout).
 	backendConn.SetReadDeadline(time.Now().Add(7 * time.Second))
 	respBuf := make([]byte, 4096)
 	rn, rerr := backendConn.Read(respBuf)
@@ -396,11 +396,16 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 }
 
 // ------------------------
-// UDP Proxy Logic
+// Two-Phase UDP Proxy Logic
 // ------------------------
 //
-// UDP traffic is only forwarded if the IP is already whitelisted.
-// New UDP connections (from non-whitelisted IPs) are ignored.
+// 1) If IP is already whitelisted, forward packets immediately.
+// 2) If not whitelisted and we're under DDoS, ignore them.
+// 3) Otherwise, do a small two-phase handshake for the FIRST packet:
+//    - Check if it looks like a FiveM handshake (if checks are not disabled).
+//    - Forward that packet to the backend, wait up to 3s for a backend response.
+//    - If we get data from the backend, we whitelist the IP and forward the data.
+//    - If no response, we ban the IP (or ignore it).
 
 type sessionData struct {
 	clientAddr  *net.UDPAddr
@@ -412,7 +417,22 @@ type sessionData struct {
 var (
 	sessionMap = make(map[string]*sessionData)
 	sessionMu  sync.Mutex
+
+	udpHandshakeChecked   = make(map[string]bool)
+	udpHandshakeCheckedMu sync.Mutex
 )
+
+func hasUDPCheckedHandshake(key string) bool {
+	udpHandshakeCheckedMu.Lock()
+	defer udpHandshakeCheckedMu.Unlock()
+	return udpHandshakeChecked[key]
+}
+
+func markUDPCheckedHandshake(key string) {
+	udpHandshakeCheckedMu.Lock()
+	udpHandshakeChecked[key] = true
+	udpHandshakeCheckedMu.Unlock()
+}
 
 func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 	listenAddr, err := net.ResolveUDPAddr("udp", ":"+listenPort)
@@ -440,6 +460,8 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		atomic.AddUint64(&ddosByteCount, uint64(n))
 
 		clientIP := clientAddr.IP.String()
+
+		// If banned, ignore
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
@@ -447,14 +469,90 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// Only forward UDP if IP is whitelisted.
+		// Already whitelisted => forward
 		if isWhitelisted(clientIP) {
 			forwardUDP(listenConn, backendAddr, clientAddr, buf[:n])
 			continue
 		}
 
-		// Otherwise, ignore new UDP traffic.
-		log.Printf("[UDP] [%s] Not whitelisted => ignoring.", clientAddr.String())
+		// If under attack, ignore new IP
+		if isDDoSActive() {
+			log.Printf("[UDP] [%s] Blocked: DDoS active, new IP not whitelisted.", clientAddr.String())
+			continue
+		}
+
+		// If we haven't checked handshake yet, do a mini two-phase check
+		if !hasUDPCheckedHandshake(clientAddr.String()) {
+			if !disableUDPHandshakeCheck {
+				if !isFiveMHandshake(buf[:n]) {
+					udpHandshakeFailuresMu.Lock()
+					udpHandshakeFailures[clientAddr.String()]++
+					failCount := udpHandshakeFailures[clientAddr.String()]
+					udpHandshakeFailuresMu.Unlock()
+					log.Printf("[UDP] [%s] Invalid handshake attempt (%d/%d).", clientAddr.String(), failCount, udpHandshakeFailureLimit)
+					if failCount >= udpHandshakeFailureLimit {
+						banIP(clientIP)
+					}
+					continue
+				}
+			}
+
+			// Attempt "two-phase" approach for UDP
+			backendConn, err := net.DialUDP("udp", nil, backendAddr)
+			if err != nil {
+				log.Printf("[UDP] [%s] Error dialing backend: %v", clientAddr.String(), err)
+				continue
+			}
+
+			// Send the packet to backend
+			_, werr := backendConn.Write(buf[:n])
+			if werr != nil {
+				log.Printf("[UDP] [%s] Error forwarding handshake to backend: %v", clientAddr.String(), werr)
+				backendConn.Close()
+				continue
+			}
+
+			// Wait up to 3s for a response
+			_ = backendConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			respBuf := make([]byte, 2048)
+			rn, rerr := backendConn.Read(respBuf)
+			_ = backendConn.SetReadDeadline(time.Time{})
+
+			if rerr != nil || rn < 1 {
+				// No real response => ban or ignore
+				log.Printf("[UDP] [%s] No backend response => banning IP.", clientAddr.String())
+				banIP(clientIP)
+				backendConn.Close()
+				continue
+			}
+
+			// We got some data => whitelist IP
+			updateWhitelist(clientIP)
+			markUDPCheckedHandshake(clientAddr.String())
+			log.Printf("[UDP] [%s] Authenticated => whitelisted.", clientAddr.String())
+
+			// Forward that backend response to the client
+			_, _ = listenConn.WriteToUDP(respBuf[:rn], clientAddr)
+
+			// Now create a session for ongoing bridging
+			sessionMu.Lock()
+			sd := &sessionData{
+				clientAddr:  clientAddr,
+				backendConn: backendConn,
+				lastActive:  time.Now(),
+			}
+			sessionMap[clientAddr.String()] = sd
+			sessionMu.Unlock()
+
+			// Spin up the bridging goroutine
+			go handleUDPSession(listenConn, sd)
+			continue
+		} else {
+			// We did a handshake check, but not whitelisted => banned
+			log.Printf("[UDP] [%s] Already handshake-checked => banned.", clientAddr.String())
+			banIP(clientIP)
+			continue
+		}
 	}
 }
 
@@ -463,6 +561,7 @@ func forwardUDP(listenConn *net.UDPConn, backendAddr *net.UDPAddr, clientAddr *n
 	key := clientAddr.String()
 	sd, exists := sessionMap[key]
 	if !exists {
+		// New session for an already whitelisted IP
 		backendConn, err := net.DialUDP("udp", nil, backendAddr)
 		if err != nil {
 			sessionMu.Unlock()
@@ -533,7 +632,6 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 		bytesCount := atomic.LoadUint64(&ddosByteCount)
 		mbps := (float64(bytesCount)*8/1e6)/10.0
 
-		// Append new values.
 		if len(ppsWindow) >= ddosWindowSize {
 			ppsWindow = ppsWindow[1:]
 			mbpsWindow = mbpsWindow[1:]
@@ -541,7 +639,6 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 		ppsWindow = append(ppsWindow, pps)
 		mbpsWindow = append(mbpsWindow, mbps)
 
-		// Compute averages.
 		var sumPps, sumMbps float64
 		for _, v := range ppsWindow {
 			sumPps += v
@@ -552,17 +649,18 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 		avgPps := sumPps / float64(len(ppsWindow))
 		avgMbps := sumMbps / float64(len(mbpsWindow))
 
-		// Reset counters.
 		atomic.StoreUint64(&ddosPacketCount, 0)
 		atomic.StoreUint64(&ddosByteCount, 0)
 
-		log.Printf("[DDoS Monitor] Avg PPS: %.2f, Avg Mbps: %.2f (Current: %.2f PPS, %.2f Mbps)", avgPps, avgMbps, pps, mbps)
+		log.Printf("[DDoS Monitor] Avg PPS: %.2f, Avg Mbps: %.2f (Current: %.2f PPS, %.2f Mbps)",
+			avgPps, avgMbps, pps, mbps)
 
 		if avgPps > ppsThreshold || avgMbps > mbpsThreshold {
 			if !attackActiveLocal {
 				setDDoSActive(true)
 				sendDDoSAttackStarted(discordWebhook, serverName, serverIP, targetPort)
-				log.Printf("[DDoS Alert] Mitigation started: Attack detected (avgPPS: %.2f, avgMbps: %.2f)", avgPps, avgMbps)
+				log.Printf("[DDoS Alert] Mitigation started: Attack detected (avgPPS: %.2f, avgMbps: %.2f)",
+					avgPps, avgMbps)
 				attackActiveLocal = true
 			}
 			consecutiveBelow = 0
@@ -572,7 +670,8 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 				if consecutiveBelow >= 2 {
 					setDDoSActive(false)
 					sendDDoSAttackEnded(discordWebhook, serverName, serverIP, targetPort)
-					log.Printf("[DDoS Alert] Mitigation ended: Attack subsided (avgPPS: %.2f, avgMbps: %.2f)", avgPps, avgMbps)
+					log.Printf("[DDoS Alert] Mitigation ended: Attack subsided (avgPPS: %.2f, avgMbps: %.2f)",
+						avgPps, avgMbps)
 					attackActiveLocal = false
 					consecutiveBelow = 0
 					ppsWindow = nil
@@ -622,7 +721,7 @@ func main() {
 		}
 	}()
 
-	// Start UDP proxy (only accept from whitelisted IPs)
+	// Start UDP proxy with two-phase approach
 	go startUDPProxy(*listenPort, *targetIP, *targetPort, *discordWebhook)
 
 	// Start DDoS detection
