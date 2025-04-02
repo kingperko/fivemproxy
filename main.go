@@ -327,57 +327,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		backendConn.Close()
 		return
 	}
-
-	// PHASE 2: Wait for backend's initial response to confirm real handshake
-	backendConn.SetReadDeadline(time.Now().Add(7 * time.Second))
-	respBuf := make([]byte, 4096)
-	rn, rerr := backendConn.Read(respBuf)
-	backendConn.SetReadDeadline(time.Time{})
-
-	if rerr != nil || rn == 0 {
-		// No meaningful response from the backend => ban
-		log.Printf("[TCP] [%s] No valid server response => banning IP.", clientIP)
-		banIP(clientIP)
-		backendConn.Close()
-		return
-	}
-
-	// Minimal check: does the response start with "HTTP/1." or contain typical server text?
-	// Real FiveM servers often respond with "HTTP/1.1 200 OK" or "401 Unauthorized" or "404 Not Found".
-	respCheck := strings.ToLower(string(respBuf[:rn]))
-	if !(strings.HasPrefix(respCheck, "http/1.") || strings.Contains(respCheck, "unauthorized") || strings.Contains(respCheck, "not found") || strings.Contains(respCheck, "content-type")) {
-		// Doesn't look like a typical FiveM/HTTP response => likely fake
-		log.Printf("[TCP] [%s] Backend response not recognized => banning IP.", clientIP)
-		banIP(clientIP)
-		backendConn.Close()
-		return
-	}
-
-	// If we get here, we consider it a real client => finalize whitelisting
-	updateWhitelist(clientIP)
-	atomic.AddInt64(&tcpConnCount, 1)
-	log.Printf("[TCP] [%s] Authenticated => whitelisted (phase 2).", clientIP)
-
-	// Forward the server's initial response to the client
-	_, _ = conn.Write(respBuf[:rn])
-
-	// Now fully bridge the remaining traffic
-	go func() {
-		defer backendConn.Close()
-		_, err := io.Copy(backendConn, conn)
-		logTCPError("copying from client to backend", err)
-	}()
-
-	go func() {
-		defer conn.Close()
-		_, err := io.Copy(conn, backendConn)
-		logTCPError("copying from backend to client", err)
-	}()
-
-	// Block until the connection is closed on either side
-	select {}
-}
-
+// PHASE 2: Wait for backend's initial response to confirm real handshake
 func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
