@@ -165,7 +165,7 @@ var (
 var (
 	udpPacketCounts   = make(map[string]int)
 	udpPacketCountsMu sync.Mutex
-	udpThreshold      = 500
+	udpThreshold      = 500 // allowed UDP packets per 10 seconds for non-whitelisted
 )
 
 func resetTCPCounts() {
@@ -244,7 +244,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	defer conn.Close()
 	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 
-	// Immediately drop if banned
+	// Immediately drop if banned.
 	bannedIPsMu.RLock()
 	if bannedIPs[clientIP] {
 		bannedIPsMu.RUnlock()
@@ -253,7 +253,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	bannedIPsMu.RUnlock()
 
-	// Simple connection rate limit
+	// Simple connection rate limit.
 	connectionRatesMu.Lock()
 	connectionRates[clientIP]++
 	if connectionRates[clientIP] > tcpThreshold {
@@ -266,20 +266,20 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 	}
 	connectionRatesMu.Unlock()
 
-	// Already whitelisted => skip handshake logic
+	// If already whitelisted, skip handshake logic.
 	if isWhitelisted(clientIP) {
 		log.Printf("[TCP] [%s] Whitelisted => connection allowed.", clientIP)
 		proxyTCP(conn, targetIP, targetPort)
 		return
 	}
 
-	// If under active DDoS, block new IP
+	// If under active DDoS, block new IP.
 	if isDDoSActive() {
 		log.Printf("[TCP] [%s] Blocked: DDoS active, new IP not whitelisted.", clientIP)
 		return
 	}
 
-	// PHASE 1: Basic handshake read
+	// PHASE 1: Basic handshake read.
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
@@ -296,7 +296,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Must be either a recognized FiveM handshake or a TLS handshake
+	// Must be either a recognized FiveM handshake or a TLS handshake.
 	if !isFiveMHandshake(buf[:n]) && !isTLSHandshake(buf[:n]) {
 		tcpHandshakeFailuresMu.Lock()
 		tcpHandshakeFailures[clientIP]++
@@ -309,7 +309,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Dial the backend for Phase 2
+	// PHASE 2: Forward handshake to backend and wait for initial response.
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
 		log.Printf("[TCP] [%s] Backend dial error: %v", clientIP, err)
@@ -320,14 +320,51 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// Write the handshake data to the backend
+	// Send handshake data to backend.
 	_, err = backendConn.Write(buf[:n])
 	if err != nil {
 		log.Printf("[TCP] [%s] Error forwarding handshake to backend: %v", clientIP, err)
 		backendConn.Close()
 		return
 	}
-// PHASE 2: Wait for backend's initial response to confirm real handshake
+
+	// Wait for backend's initial response.
+	backendConn.SetReadDeadline(time.Now().Add(7 * time.Second))
+	respBuf := make([]byte, 4096)
+	rn, rerr := backendConn.Read(respBuf)
+	backendConn.SetReadDeadline(time.Time{})
+	if rerr != nil || rn < 10 {
+		log.Printf("[TCP] [%s] Backend response too short or error (rn: %d, err: %v) => banning IP.", clientIP, rn, rerr)
+		banIP(clientIP)
+		backendConn.Close()
+		return
+	}
+
+	// Finalize whitelisting.
+	updateWhitelist(clientIP)
+	atomic.AddInt64(&tcpConnCount, 1)
+	log.Printf("[TCP] [%s] Authenticated => whitelisted (phase 2).", clientIP)
+
+	// Forward backend's response to the client.
+	_, _ = conn.Write(respBuf[:rn])
+
+	// Now fully bridge traffic between client and backend.
+	go func() {
+		defer backendConn.Close()
+		_, err := io.Copy(backendConn, conn)
+		logTCPError("copying from client to backend", err)
+	}()
+
+	go func() {
+		defer conn.Close()
+		_, err := io.Copy(conn, backendConn)
+		logTCPError("copying from backend to client", err)
+	}()
+
+	// Block until connection is closed.
+	select {}
+}
+
 func proxyTCP(client net.Conn, targetIP, targetPort string) {
 	backendConn, err := net.Dial("tcp", net.JoinHostPort(targetIP, targetPort))
 	if err != nil {
@@ -361,10 +398,9 @@ func proxyTCP(client net.Conn, targetIP, targetPort string) {
 // ------------------------
 // UDP Proxy Logic
 // ------------------------
-// 
-// Here, we can take a simpler approach: 
-// - Only accept UDP from IPs that are already whitelisted (via the TCP handshake).
-// - If not whitelisted, we do a minimal check. If under DDoS, we block new IPs entirely.
+//
+// UDP traffic is only forwarded if the IP is already whitelisted.
+// New UDP connections (from non-whitelisted IPs) are ignored.
 
 type sessionData struct {
 	clientAddr  *net.UDPAddr
@@ -404,7 +440,6 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		atomic.AddUint64(&ddosByteCount, uint64(n))
 
 		clientIP := clientAddr.IP.String()
-
 		bannedIPsMu.RLock()
 		if bannedIPs[clientIP] {
 			bannedIPsMu.RUnlock()
@@ -412,22 +447,14 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// If the IP is already whitelisted, just forward
+		// Only forward UDP if IP is whitelisted.
 		if isWhitelisted(clientIP) {
 			forwardUDP(listenConn, backendAddr, clientAddr, buf[:n])
 			continue
 		}
 
-		// If we are under attack, block new IP
-		if isDDoSActive() {
-			continue
-		}
-
-		// Otherwise, do a minimal check or just ban.
-		// Because FiveM typically starts with TCP handshake, 
-		// you might want to ban or ignore new UDP from unknown IPs.
-		log.Printf("[UDP] [%s] Not whitelisted => ignoring or banning.", clientAddr.String())
-		continue
+		// Otherwise, ignore new UDP traffic.
+		log.Printf("[UDP] [%s] Not whitelisted => ignoring.", clientAddr.String())
 	}
 }
 
@@ -506,7 +533,7 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 		bytesCount := atomic.LoadUint64(&ddosByteCount)
 		mbps := (float64(bytesCount)*8/1e6)/10.0
 
-		// Append new values
+		// Append new values.
 		if len(ppsWindow) >= ddosWindowSize {
 			ppsWindow = ppsWindow[1:]
 			mbpsWindow = mbpsWindow[1:]
@@ -514,7 +541,7 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 		ppsWindow = append(ppsWindow, pps)
 		mbpsWindow = append(mbpsWindow, mbps)
 
-		// Compute averages
+		// Compute averages.
 		var sumPps, sumMbps float64
 		for _, v := range ppsWindow {
 			sumPps += v
@@ -525,7 +552,7 @@ func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 		avgPps := sumPps / float64(len(ppsWindow))
 		avgMbps := sumMbps / float64(len(mbpsWindow))
 
-		// Reset counters
+		// Reset counters.
 		atomic.StoreUint64(&ddosPacketCount, 0)
 		atomic.StoreUint64(&ddosByteCount, 0)
 
