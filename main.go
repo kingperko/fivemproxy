@@ -21,7 +21,7 @@ import (
 // ------------------------
 
 const disableDiscord = false         // Set to false to enable Discord notifications.
-const disableUDPHandshakeCheck = true  // Disable UDP handshake check if needed.
+const disableUDPHandshakeCheck = true  // Set to true to disable UDP handshake check (if needed).
 
 // discordEmbed defines the structure of a Discord embed.
 type discordEmbed struct {
@@ -151,7 +151,7 @@ var (
 var (
 	udpPacketCounts   = make(map[string]int)
 	udpPacketCountsMu sync.Mutex
-	udpThreshold      = 500 // allowed UDP packets per 10 seconds
+	udpThreshold      = 500 // allowed UDP packets per 10 seconds for non-whitelisted clients
 )
 
 // resetTCPCounts clears the TCP connection counts every 10 seconds.
@@ -211,12 +211,13 @@ func isTCPHandshake(data []byte) bool {
 		(data[2] >= 0x00 && data[2] <= 0x03)
 }
 
-// isFiveMHandshake checks for known FiveM GET/POST patterns.
+// isFiveMHandshake checks for known FiveM GET/POST patterns and common client signatures.
 func isFiveMHandshake(data []byte) bool {
 	lower := strings.ToLower(string(data))
 	return strings.Contains(lower, "get /info.json") ||
 		strings.Contains(lower, "get /players.json") ||
-		strings.Contains(lower, "post /client")
+		strings.Contains(lower, "post /client") ||
+		strings.Contains(lower, "citizenfx")
 }
 
 // ------------------------
@@ -272,7 +273,7 @@ func handleTCPConnection(conn net.Conn, targetIP, targetPort, discordWebhook str
 		return
 	}
 
-	// Validate handshake.
+	// Validate handshake for FiveM.
 	if !isTCPHandshake(buf[:n]) && !isFiveMHandshake(buf[:n]) {
 		tcpHandshakeFailuresMu.Lock()
 		tcpHandshakeFailures[clientIP]++
@@ -417,7 +418,7 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 		}
 		bannedIPsMu.RUnlock()
 
-		// UDP handshake check.
+		// UDP handshake check: if not already whitelisted, verify handshake.
 		if !isWhitelisted(clientAddr.IP.String()) && !hasCheckedHandshake(clientKey) {
 			if !disableUDPHandshakeCheck {
 				if !isFiveMHandshake(buf[:n]) {
@@ -441,18 +442,20 @@ func startUDPProxy(listenPort, targetIP, targetPort, discordWebhook string) {
 			continue
 		}
 
-		// UDP rate limiting.
-		udpPacketCountsMu.Lock()
-		udpPacketCounts[clientKey]++
-		if udpPacketCounts[clientKey] > udpThreshold {
-			bannedIPsMu.Lock()
-			bannedIPs[clientAddr.IP.String()] = true
-			bannedIPsMu.Unlock()
+		// Only apply UDP rate limiting for non-whitelisted clients.
+		if !isWhitelisted(clientAddr.IP.String()) {
+			udpPacketCountsMu.Lock()
+			udpPacketCounts[clientKey]++
+			if udpPacketCounts[clientKey] > udpThreshold {
+				bannedIPsMu.Lock()
+				bannedIPs[clientAddr.IP.String()] = true
+				bannedIPsMu.Unlock()
+				udpPacketCountsMu.Unlock()
+				log.Printf("[UDP] [%s] Banned: Excessive packet rate", clientKey)
+				continue
+			}
 			udpPacketCountsMu.Unlock()
-			log.Printf("[UDP] [%s] Banned: Excessive packet rate", clientKey)
-			continue
 		}
-		udpPacketCountsMu.Unlock()
 
 		// Create or update session.
 		sessionMu.Lock()
@@ -511,7 +514,7 @@ func handleUDPSession(listenConn *net.UDPConn, sd *sessionData) {
 // New DDoS Detection Logic
 // ------------------------
 // This new logic uses a sliding window (moving average) over 10-second intervals.
-// It requires sustained high traffic before activating mitigation and only ends after two consecutive low intervals.
+// It requires sustained high traffic before activating mitigation and ends after two consecutive low intervals.
 
 func monitorDDoS(discordWebhook, serverName, serverIP, targetPort string) {
 	const interval = 10 * time.Second
@@ -599,7 +602,7 @@ func main() {
 
 	log.Printf("[INFO] Starting proxy: forwarding to %s:%s on port %s", *targetIP, *targetPort, *listenPort)
 
-	// Start rate limiting reset goroutines.
+	// Start rate limit reset goroutines.
 	go resetTCPCounts()
 	go resetUDPPacketCounts()
 
